@@ -1142,15 +1142,15 @@ def load_universe(filepath: str, encoding: Optional[str] = None) -> pd.DataFrame
 
 def main():
     # ---- Configuration ----
-    universe_path = r"./data/Preqin_Cashflow_export.xlsx"
+    universe_path = r"C:\Box\MZhang\Ad Hoc\2026 simulation\PF structure\Preqin_Cashflow_export.csv"
     asset_class = "Venture Capital"
     n_vintages = 20
     n_per_vintage = 10
     start_year = 2006
     end_year = 2025
     commitment = 1.0
-    simulations = 5000
-    output_path = r"./output"
+    simulations = 1
+    output_path = r"C:\Box\MZhang\Ad Hoc\2026 simulation\PF structure"
     audit_simulation_number = 0
 
     # ---- Load data ----
