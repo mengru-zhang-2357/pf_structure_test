@@ -344,9 +344,23 @@ def run_simulation_constant_age_by_year(
     initial_navs_vec = _np.zeros(n_initial, dtype=float)
     initial_cum_calls_vec = _np.zeros(n_initial, dtype=float)
     for i, fid in enumerate(initial_fund_ids):
-        rec_start = fund_year_record.get((fid, int(start_year)))
-        if rec_start is not None:
-            nav_begin = float(rec_start.get("nav_begin", 0.0))
+        last_mark_year = get_last_observed_year_at_or_before(
+            observed_years_by_fund=observed_years_by_fund,
+            fund_id=fid,
+            scenario_year=int(start_year),
+        )
+        if last_mark_year is not None:
+            rec_last = fund_year_record.get((fid, int(last_mark_year)))
+            if rec_last is not None:
+                nav_mark = float(rec_last.get("nav_begin", 0.0))
+                staleness = int(start_year) - int(last_mark_year)
+                keep_pct, _, _ = stale_mark_runoff_params(staleness)
+                nav_begin = nav_mark * keep_pct
+            else:
+                nav_begin = 0.0
+        else:
+            nav_begin = 0.0
+        if nav_begin > 0.0:
             nav_begin_multiple = nav_begin / FUND_COMMITMENT
             initial_navs_vec[i] = nav_begin_multiple * commitments_initial[i]
 
