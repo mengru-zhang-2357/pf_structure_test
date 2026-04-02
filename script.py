@@ -271,6 +271,7 @@ def run_simulation_constant_age_by_year(
     portfolio_df: pd.DataFrame,
     patterns_by_year: Dict[int, Dict[int, List[PatternRecord]]],
     scenario_years: Iterable[int],
+    target_commit_pct: float = 0.125,
     num_simulations: int = 500,
     return_fund_level: bool = True,
     audit_simulation_number: Optional[int] = 0,
@@ -293,8 +294,6 @@ def run_simulation_constant_age_by_year(
     burnin_ages = _np.maximum(start_year - vintage_years_initial + 1, 1)
 
     funds_per_vintage = int(portfolio_df.groupby("vintage_year").size().mode().iloc[0])
-    new_fund_commitment = float(commitments_initial[0])
-    annual_new_commitment = funds_per_vintage * new_fund_commitment
     initial_fund_ids = portfolio_df["fund_id"].to_numpy()
 
     n_new_total = funds_per_vintage * n_scenario_years
@@ -397,10 +396,24 @@ def run_simulation_constant_age_by_year(
     fund_names_list: List[str] = list(portfolio_df["fund_name"].to_numpy())
 
     for year_idx, year in enumerate(scenario_years_list):
+        boy_nav_for_commit = _np.where(
+            is_active,
+            nav_pf[:, :n_active].sum(axis=1),
+            0.0,
+        )
+        valid_boy_nav = boy_nav_for_commit[_np.isfinite(boy_nav_for_commit) & (boy_nav_for_commit > 0.0)]
+        avg_boy_nav_for_commit = float(valid_boy_nav.mean()) if valid_boy_nav.size > 0 else 0.0
+        annual_new_commitment = float(target_commit_pct) * avg_boy_nav_for_commit if avg_boy_nav_for_commit > 0 else 0.0
+        per_fund_commitment = (
+            annual_new_commitment / funds_per_vintage
+            if funds_per_vintage > 0 and annual_new_commitment > 0.0
+            else 0.0
+        )
+
         if year_idx > 0:
             ns = n_active
             ne = n_active + funds_per_vintage
-            commitments_all[ns:ne] = new_fund_commitment
+            commitments_all[ns:ne] = per_fund_commitment
             creation_years[ns:ne] = year
             vintage_pool = fund_ids_by_vintage.get(year, [])
             if vintage_pool:
@@ -797,6 +810,7 @@ def main():
     start_year = 2006
     end_year = 2025
     commitment = 1.0
+    target_commit_pct = 0.125
     simulations = 1
     output_path = r"C:\Box\MZhang\Ad Hoc\2026 simulation\PF structure"
     audit_simulation_number = 0
@@ -825,6 +839,7 @@ def main():
         portfolio_df=portfolio_df,
         patterns_by_year=patterns_by_year,
         scenario_years=scenario_years,
+        target_commit_pct=target_commit_pct,
         num_simulations=simulations,
         return_fund_level=True,
         audit_simulation_number=audit_simulation_number,
