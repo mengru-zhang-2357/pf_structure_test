@@ -31,6 +31,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 PatternRecord = Dict[str, Any]
+FUND_COMMITMENT = 10_000_000.0
 
 
 def _coerce_pattern_record(
@@ -186,17 +187,12 @@ def compute_pattern_dict_by_year(
         df["TRANSACTION AMOUNT"].abs(), 0.0,
     )
 
-    total_called = df.groupby("FUND ID")["call_amount"].sum().to_dict()
-
     grouped = (
         df.groupby(["FUND ID", "transaction_year", "fund_age"])
         .agg(call_amount=("call_amount", "sum"), dist_amount=("dist_amount", "sum"))
         .reset_index()
     )
-    grouped["total_called"] = grouped["FUND ID"].map(total_called)
-    grouped["call_pct"] = grouped.apply(
-        lambda r: r["call_amount"] / r["total_called"] if r["total_called"] > 0 else 0.0, axis=1,
-    )
+    grouped["call_pct"] = grouped["call_amount"] / FUND_COMMITMENT
 
     nav_metrics = _compute_nav_growth_by_fund_age(df)
     grouped = grouped.merge(nav_metrics, on=["FUND ID", "fund_age"], how="left")
@@ -286,7 +282,6 @@ def run_simulation_constant_age_by_year(
     fund_meta: Dict[object, Dict[str, object]] = {}
     fund_ids_by_vintage: Dict[int, List[object]] = {}
     fund_call_curve: Dict[object, Dict[int, float]] = {}
-    fund_total_called: Dict[object, float] = {}
     for year, ages_map in patterns_by_year.items():
         for _, records in ages_map.items():
             for raw in records:
@@ -297,7 +292,6 @@ def run_simulation_constant_age_by_year(
                 yk = int(year)
                 fund_year_record[(fund_id, yk)] = rec
                 fund_call_curve.setdefault(fund_id, {})[yk] = float(rec.get("call_pct", 0.0))
-                fund_total_called[fund_id] = fund_total_called.get(fund_id, 0.0) + float(rec.get("period_calls", 0.0))
                 meta = fund_meta.setdefault(fund_id, {})
                 if meta.get("fund_name") is None and rec.get("fund_name") is not None:
                     meta["fund_name"] = rec.get("fund_name")
@@ -316,9 +310,8 @@ def run_simulation_constant_age_by_year(
     for i, fid in enumerate(initial_fund_ids):
         rec_start = fund_year_record.get((fid, int(start_year)))
         if rec_start is not None:
-            total_called = float(fund_total_called.get(fid, 0.0))
             nav_begin = float(rec_start.get("nav_begin", 0.0))
-            nav_begin_multiple = (nav_begin / total_called) if total_called > 0 else 0.0
+            nav_begin_multiple = nav_begin / FUND_COMMITMENT
             initial_navs_vec[i] = nav_begin_multiple * commitments_initial[i]
 
         hist_calls = fund_call_curve.get(fid, {})
