@@ -30,7 +30,7 @@ from pathlib import Path
 # Configuration
 # ---------------------------------------------------------------------------
 
-MIN_BUCKET_SIZE = 5  # Minimum observations per (year, age) bucket before fallback
+MIN_BUCKET_SIZE = 5  # Legacy constant; no fallback sampling is used.
 PatternRecord = Dict[str, Any]
 LegacyPatternTuple = Tuple[float, float, float]
 PatternLike = Union[PatternRecord, LegacyPatternTuple]
@@ -454,13 +454,11 @@ def sample_initial_fund_state_matrices(
 def run_simulation_constant_age_by_year(
     portfolio_df: pd.DataFrame,
     patterns_by_year: Dict[int, Dict[int, List[PatternLike]]],
-    pattern_dict_fallback: Dict[int, List[PatternLike]],
     initial_state_pool_by_age: Dict[int, List[Tuple[float, float]]],
     scenario_years: Iterable[int],
     base_year_end: int,
     num_simulations: int = 500,
     return_fund_level: bool = False,
-    min_bucket_size: int = MIN_BUCKET_SIZE,
     audit_simulation_number: Optional[int] = 0,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Simulate cash flows with recallable distribution mechanics.
@@ -471,11 +469,13 @@ def run_simulation_constant_age_by_year(
     cumulative called). LP purchases the portfolio at NAV and commits
     an equal amount as reserve.
 
-    **Dynamic aging:**
-    All funds age dynamically. Burn-in funds start at their age as of
-    the first scenario year and advance by 1 each simulation year; new
-    fund slots start at age 1. New fund slots are added each simulation
-    year.
+    **Persistent-fund identity paths:**
+    Existing portfolio slots keep their original ``fund_id`` through the
+    simulation horizon. Each year, new slots are created and assigned a
+    sampled ``fund_id`` from that vintage-year cohort; each assigned
+    fund is then followed through its own observed year-level cash-flow
+    records. If a slot's selected fund has no row for a scenario year,
+    its call/dist/NAV-growth are set to zero for that year.
 
     **Recallable distributions:**
     * Excess cash (dists > calls) is paid to the LP as a recallable
@@ -486,9 +486,11 @@ def run_simulation_constant_age_by_year(
     """
     import numpy as _np
 
-    if not pattern_dict_fallback:
-        raise ValueError("pattern_dict_fallback is empty")
-    max_age_global = max(pattern_dict_fallback.keys())
+    if "fund_id" not in portfolio_df.columns:
+        raise ValueError("portfolio_df must include 'fund_id' for persistent fund-identity simulation")
+    if not initial_state_pool_by_age:
+        raise ValueError("initial_state_pool_by_age is empty")
+    max_age_global = max(initial_state_pool_by_age.keys())
 
     scenario_years_list = list(scenario_years)
     if not scenario_years_list:
@@ -507,6 +509,7 @@ def run_simulation_constant_age_by_year(
         portfolio_df.groupby("vintage_year").size().mode().iloc[0]
     )
     new_fund_commitment = float(commitments_initial[0])
+    initial_fund_ids = portfolio_df["fund_id"].to_numpy()
 
     # Pre-allocate for max portfolio size: initial + new funds over all years
     n_new_total = funds_per_vintage * n_scenario_years
@@ -551,17 +554,60 @@ def run_simulation_constant_age_by_year(
     n_active = n_initial
     running_commitment = float(commitments_initial.sum())
 
-    # Fund names for reporting
-    fund_names_list = list(portfolio_df["fund_name"].to_numpy())
+    # Build lookup tables for persistent fund-level paths.
+    fund_year_record: Dict[Tuple[object, int], PatternRecord] = {}
+    fund_meta: Dict[object, Dict[str, object]] = {}
+    fund_ids_by_vintage: Dict[int, List[object]] = {}
+    for year, ages_map in patterns_by_year.items():
+        for _, records in ages_map.items():
+            for raw in records:
+                rec = _coerce_pattern_record(raw)
+                fund_id = rec.get("fund_id")
+                if fund_id is None:
+                    continue
+                year_key = int(year)
+                fund_year_record[(fund_id, year_key)] = rec
+                meta = fund_meta.setdefault(fund_id, {})
+                if meta.get("fund_name") is None and rec.get("fund_name") is not None:
+                    meta["fund_name"] = rec.get("fund_name")
+                if meta.get("vintage_year") is None and rec.get("vintage_year") is not None:
+                    meta["vintage_year"] = int(rec.get("vintage_year"))
+                vy = rec.get("vintage_year")
+                if vy is not None and pd.notna(vy):
+                    fund_ids_by_vintage.setdefault(int(vy), []).append(fund_id)
 
+    fund_ids_by_vintage = {
+        vy: list(dict.fromkeys(ids)) for vy, ids in fund_ids_by_vintage.items()
+    }
+    if not fund_ids_by_vintage:
+        raise ValueError("patterns_by_year has no fund_id/vintage_year information")
+
+    # Per-simulation slot assignments.
+    slot_fund_ids = _np.full((num_simulations, n_max), None, dtype=object)
+    slot_fund_ids[:, :n_initial] = _np.broadcast_to(initial_fund_ids, (num_simulations, n_initial))
+
+    # Fund names for reporting
+    fund_names_list: List[str] = list(portfolio_df["fund_name"].to_numpy())
     for year_idx, year in enumerate(scenario_years_list):
         # ---- Deploy new fund slots ----
         ns = n_active
         ne = n_active + funds_per_vintage
         commitments_all[ns:ne] = new_fund_commitment
         creation_years[ns:ne] = year
-        for j in range(funds_per_vintage):
-            fund_names_list.append(f"New_{year}{chr(ord('A') + j)}")
+        vintage_pool = fund_ids_by_vintage.get(year, [])
+        if vintage_pool:
+            sampled_new_ids = _np.random.choice(vintage_pool, size=(num_simulations, funds_per_vintage), replace=True)
+            slot_fund_ids[:, ns:ne] = sampled_new_ids
+            for j in range(funds_per_vintage):
+                fid0 = sampled_new_ids[0, j]
+                meta = fund_meta.get(fid0, {})
+                default_name = f"New_{year}{chr(ord('A') + j)}"
+                fund_names_list.append(str(meta.get("fund_name", default_name)))
+        else:
+            # No observed funds for this vintage -> new slots remain with zero flows.
+            slot_fund_ids[:, ns:ne] = None
+            for j in range(funds_per_vintage):
+                fund_names_list.append(f"New_{year}{chr(ord('A') + j)}")
         n_active = ne
         running_commitment += funds_per_vintage * new_fund_commitment
 
@@ -574,7 +620,7 @@ def run_simulation_constant_age_by_year(
             )
         trunc_ages = _np.clip(ages, 1, max_age_global)
 
-        # ---- Sample patterns for all active funds ----
+        # ---- Pull persistent fund-level records for all active slots ----
         call_mat = _np.zeros((num_simulations, n_active), dtype=float)
         dnav_mat = _np.zeros((num_simulations, n_active), dtype=float)
         navg_mat = _np.zeros((num_simulations, n_active), dtype=float)
@@ -584,28 +630,23 @@ def run_simulation_constant_age_by_year(
         sampled_vintage_year = _np.full((num_simulations, n_active), None, dtype=object)
         sampled_txn_year = _np.full((num_simulations, n_active), None, dtype=object)
 
-        for age_key in set(trunc_ages.tolist()):
-            idx = _np.where(trunc_ages == age_key)[0]
-            if idx.size == 0:
-                continue
-            records = patterns_by_year.get(year, {}).get(age_key)
-            if not (records and len(records) >= min_bucket_size):
-                records = pattern_dict_fallback.get(age_key, [])
-            if not records:
-                continue
-            records = [_coerce_pattern_record(r, age=age_key, transaction_year=year) for r in records]
-            L = len(records)
-            ri = _np.random.randint(0, L, size=(num_simulations, idx.size))
-            for col_pos, fund_idx in enumerate(idx):
-                chosen = [records[r] for r in ri[:, col_pos]]
-                call_mat[:, fund_idx] = _np.array([r["call_pct"] for r in chosen], dtype=float)
-                dnav_mat[:, fund_idx] = _np.array([r["dist_nav_pct"] for r in chosen], dtype=float)
-                navg_mat[:, fund_idx] = _np.array([r["nav_growth_pct"] for r in chosen], dtype=float)
-                sampled_nav_begin_mat[:, fund_idx] = _np.array([r.get("nav_begin", 0.0) for r in chosen], dtype=float)
-                sampled_fund_id[:, fund_idx] = [r.get("fund_id") for r in chosen]
-                sampled_fund_name[:, fund_idx] = [r.get("fund_name") for r in chosen]
-                sampled_vintage_year[:, fund_idx] = [r.get("vintage_year") for r in chosen]
-                sampled_txn_year[:, fund_idx] = [r.get("transaction_year") for r in chosen]
+        for fund_idx in range(n_active):
+            fund_ids_col = slot_fund_ids[:, fund_idx]
+            unique_ids = [fid for fid in dict.fromkeys(fund_ids_col.tolist()) if fid is not None]
+            for fid in unique_ids:
+                rec = fund_year_record.get((fid, int(year)))
+                if rec is None:
+                    continue
+                rec = _coerce_pattern_record(rec, age=int(trunc_ages[fund_idx]), transaction_year=int(year))
+                mask = (fund_ids_col == fid)
+                call_mat[mask, fund_idx] = float(rec["call_pct"])
+                dnav_mat[mask, fund_idx] = float(rec["dist_nav_pct"])
+                navg_mat[mask, fund_idx] = float(rec["nav_growth_pct"])
+                sampled_nav_begin_mat[mask, fund_idx] = float(rec.get("nav_begin", 0.0))
+                sampled_fund_id[mask, fund_idx] = rec.get("fund_id")
+                sampled_fund_name[mask, fund_idx] = rec.get("fund_name")
+                sampled_vintage_year[mask, fund_idx] = rec.get("vintage_year")
+                sampled_txn_year[mask, fund_idx] = rec.get("transaction_year")
 
         # ---- Calls: capped at remaining commitment ----
         c_all = commitments_all[:n_active]
@@ -1123,14 +1164,12 @@ def main():
     # ---- Run simulation ----
     if use_year_specific:
         patterns_by_year = compute_pattern_dict_by_year(universe_df, asset_class)
-        pattern_dict_fallback = compute_pattern_dict(universe_df, asset_class)
         initial_state_pool_by_age = build_initial_state_pool_by_age(universe_df, asset_class)
         if not patterns_by_year:
             raise RuntimeError(f"No year-specific patterns for {asset_class!r}")
         fund_df, agg_df, audit_df = run_simulation_constant_age_by_year(
             portfolio_df=portfolio_df,
             patterns_by_year=patterns_by_year,
-            pattern_dict_fallback=pattern_dict_fallback,
             initial_state_pool_by_age=initial_state_pool_by_age,
             scenario_years=scenario_years,
             base_year_end=end_year,
