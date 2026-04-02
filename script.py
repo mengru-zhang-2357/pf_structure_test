@@ -125,20 +125,21 @@ def _compute_nav_growth_by_fund_age(
     def _g(row):
         numerator = (row["nav_end"] - row["nav_begin"]
                      - row["period_calls"] + row["period_dists"])
-        denom = (row["nav_begin"]
-                 + 0.5 * row["period_calls"]
-                 - 0.5 * row["period_dists"])
+        denom = (row["nav_begin"])
+                 # + 0.5 * row["period_calls"]
+                 # - 0.5 * row["period_dists"])
         if denom <= 0:
             return 0.0
         return numerator / denom
 
-    nav_fa["nav_growth_pct"] = nav_fa.apply(_g, axis=1).clip(clip_lo, clip_hi)
+    nav_fa["nav_growth_pct"] = nav_fa.apply(_g, axis=1)
+    #nav_fa["nav_growth_pct"] = nav_fa.apply(_g, axis=1).clip(clip_lo, clip_hi)
     nav_fa["dist_nav_pct"] = np.where(
         nav_fa["nav_begin"] > 0,
         nav_fa["period_dists"] / nav_fa["nav_begin"],
         0.0,
     )
-    nav_fa["dist_nav_pct"] = nav_fa["dist_nav_pct"].clip(0.0, dist_nav_clip_hi)
+    #nav_fa["dist_nav_pct"] = nav_fa["dist_nav_pct"].clip(0.0, dist_nav_clip_hi)
 
     return nav_fa[
         [
@@ -244,7 +245,7 @@ def run_simulation_constant_age_by_year(
     patterns_by_year: Dict[int, Dict[int, List[PatternRecord]]],
     scenario_years: Iterable[int],
     num_simulations: int = 500,
-    return_fund_level: bool = False,
+    return_fund_level: bool = True,
     audit_simulation_number: Optional[int] = 0,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Simulate cash flows with BOY/EOY LP and manager unfunded tracking."""
@@ -424,7 +425,7 @@ def run_simulation_constant_age_by_year(
         avg_nav_growth = (navg_mat * w).sum(axis=1)
 
         dist_amounts = dnav_mat * nav_begin
-        dist_amounts = _np.minimum(dist_amounts, _np.maximum(nav_begin, 0.0))
+        #dist_amounts = _np.minimum(dist_amounts, _np.maximum(nav_begin, 0.0))
         dist_amounts = _np.where(is_active[:, None], dist_amounts, 0.0)
 
         nav_pf[:, :n_active] = nav_pf[:, :n_active] * (1.0 + navg_mat) + call_amounts - dist_amounts
@@ -463,7 +464,7 @@ def run_simulation_constant_age_by_year(
         manager_unfunded_pct = _np.where(fof_nav > 0, manager_unfunded / fof_nav, 0.0)
         lp_unfunded_pct = _np.where(fof_nav > 0, lp_unfunded / fof_nav, 0.0)
         lp_reserve_pct = _np.where(fof_nav > 0, lp_reserve / fof_nav, 0.0)
-        lp_breach = _np.where(lp_unfunded_pct < 0.20, 1, 0)
+        lp_breach = _np.where(lp_reserve_pct < 0.20, 1, 0)
 
         for sim in range(num_simulations):
             if not is_active[sim]:
@@ -713,11 +714,6 @@ def main():
     # ---- Load data ----
     universe_df = load_universe(universe_path)
 
-    # Intended support status: only year-specific engine is supported.
-    use_year_specific = True
-    if not use_year_specific:
-        raise RuntimeError("Legacy age-only mode is no longer supported.")
-
     # ---- Build portfolio ----
     portfolio_df = build_sampled_portfolio_from_universe(
         universe_df=universe_df,
@@ -740,7 +736,7 @@ def main():
         patterns_by_year=patterns_by_year,
         scenario_years=scenario_years,
         num_simulations=simulations,
-        return_fund_level=False,
+        return_fund_level=True,
         audit_simulation_number=audit_simulation_number,
     )
 
