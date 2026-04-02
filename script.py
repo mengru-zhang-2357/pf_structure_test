@@ -23,58 +23,38 @@ Key features
 
 import pandas as pd
 import numpy as np
-from typing import Any, Dict, List, Tuple, Optional, Iterable, Union
+from typing import Any, Dict, List, Tuple, Optional, Iterable
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-MIN_BUCKET_SIZE = 5  # Legacy constant; no fallback sampling is used.
 PatternRecord = Dict[str, Any]
-LegacyPatternTuple = Tuple[float, float, float]
-PatternLike = Union[PatternRecord, LegacyPatternTuple]
 
 
 def _coerce_pattern_record(
-    pattern: PatternLike,
+    pattern: PatternRecord,
     age: Optional[int] = None,
     transaction_year: Optional[int] = None,
 ) -> PatternRecord:
-    """Normalize tuple/dict pattern payloads into a record shape."""
-    if isinstance(pattern, dict):
-        rec = dict(pattern)
-        if age is not None and rec.get("fund_age") is None:
-            rec["fund_age"] = age
-        if transaction_year is not None and rec.get("transaction_year") is None:
-            rec["transaction_year"] = transaction_year
-        rec.setdefault("fund_id", None)
-        rec.setdefault("fund_name", None)
-        rec.setdefault("vintage_year", None)
-        rec.setdefault("call_pct", 0.0)
-        rec.setdefault("dist_nav_pct", 0.0)
-        rec.setdefault("nav_growth_pct", 0.0)
-        rec.setdefault("nav_begin", 0.0)
-        rec.setdefault("nav_end", 0.0)
-        rec.setdefault("period_calls", 0.0)
-        rec.setdefault("period_dists", 0.0)
-        return rec
-
-    call_pct, dist_nav_pct, nav_growth_pct = pattern
-    return {
-        "fund_id": None,
-        "fund_name": None,
-        "vintage_year": None,
-        "fund_age": age,
-        "transaction_year": transaction_year,
-        "call_pct": float(call_pct),
-        "dist_nav_pct": float(dist_nav_pct),
-        "nav_growth_pct": float(nav_growth_pct),
-        "nav_begin": 0.0,
-        "nav_end": 0.0,
-        "period_calls": 0.0,
-        "period_dists": 0.0,
-    }
+    """Normalize pattern payloads into a full record shape."""
+    rec = dict(pattern)
+    if age is not None and rec.get("fund_age") is None:
+        rec["fund_age"] = age
+    if transaction_year is not None and rec.get("transaction_year") is None:
+        rec["transaction_year"] = transaction_year
+    rec.setdefault("fund_id", None)
+    rec.setdefault("fund_name", None)
+    rec.setdefault("vintage_year", None)
+    rec.setdefault("call_pct", 0.0)
+    rec.setdefault("dist_nav_pct", 0.0)
+    rec.setdefault("nav_growth_pct", 0.0)
+    rec.setdefault("nav_begin", 0.0)
+    rec.setdefault("nav_end", 0.0)
+    rec.setdefault("period_calls", 0.0)
+    rec.setdefault("period_dists", 0.0)
+    return rec
 
 # ---------------------------------------------------------------------------
 # Asset class mapping
@@ -178,80 +158,6 @@ def _compute_nav_growth_by_fund_age(
 # Pattern construction
 # ---------------------------------------------------------------------------
 
-def compute_pattern_dict(
-    universe_df: pd.DataFrame, asset_class: str
-) -> Dict[int, List[PatternRecord]]:
-    """Compute call, distribution, and NAV-growth patterns by fund age.
-
-    Returns ``pattern_dict[age]`` → list of rich pattern records.
-    """
-    df = universe_df.copy()
-    df["asset_class_mapped"] = df["ASSET CLASS"].apply(map_universe_asset_class)
-    df = df[df["asset_class_mapped"] == asset_class].copy()
-
-    df["transaction_year"] = pd.to_datetime(df["TRANSACTION DATE"], errors="coerce").dt.year
-    df["vintage_year"] = pd.to_numeric(df["VINTAGE / INCEPTION YEAR"], errors="coerce")
-    df["fund_age"] = df["transaction_year"] - df["vintage_year"] + 1
-    df = df[(df["fund_age"].notna()) & (df["fund_age"] > 0)].copy()
-
-    df["call_amount"] = np.where(
-        df["TRANSACTION TYPE"].str.lower().str.contains("capital call", na=False),
-        df["TRANSACTION AMOUNT"].abs(), 0.0,
-    )
-    df["dist_amount"] = np.where(
-        df["TRANSACTION TYPE"].str.lower().str.contains("distribution", na=False),
-        df["TRANSACTION AMOUNT"].abs(), 0.0,
-    )
-
-    total_called = df.groupby("FUND ID")["call_amount"].sum().to_dict()
-
-    pat = (
-        df.groupby(["FUND ID", "fund_age"])
-        .agg(call_amount=("call_amount", "sum"), dist_amount=("dist_amount", "sum"))
-        .reset_index()
-    )
-    pat["total_called"] = pat["FUND ID"].map(total_called)
-    pat["call_pct"] = pat.apply(
-        lambda r: r["call_amount"] / r["total_called"] if r["total_called"] > 0 else 0.0, axis=1,
-    )
-
-    nav_metrics = _compute_nav_growth_by_fund_age(df)
-    pat = pat.merge(nav_metrics, on=["FUND ID", "fund_age"], how="left")
-    pat["nav_growth_pct"] = pat["nav_growth_pct"].fillna(0.0)
-    pat["dist_nav_pct"] = pat["dist_nav_pct"].fillna(0.0)
-
-    fund_name_col = "FUND NAME" if "FUND NAME" in df.columns else None
-    fund_meta_cols = ["FUND ID", "vintage_year"]
-    if fund_name_col is not None:
-        fund_meta_cols.append(fund_name_col)
-    fund_meta = (
-        df.groupby("FUND ID")[fund_meta_cols[1:]]
-        .first()
-        .reset_index()
-        .rename(columns={fund_name_col: "fund_name"} if fund_name_col else {})
-    )
-    pat = pat.merge(fund_meta, on="FUND ID", how="left")
-
-    pattern_dict: Dict[int, List[PatternRecord]] = {}
-    for _, row in pat.iterrows():
-        age = int(row["fund_age"])
-        pattern_dict.setdefault(age, []).append({
-            "fund_id": row["FUND ID"],
-            "fund_name": row.get("fund_name") if "fund_name" in row else None,
-            "vintage_year": int(row["vintage_year"]) if pd.notna(row["vintage_year"]) else None,
-            "fund_age": age,
-            "transaction_year": None,
-            "call_pct": float(row["call_pct"]),
-            "dist_nav_pct": float(row["dist_nav_pct"]),
-            "nav_growth_pct": float(row["nav_growth_pct"]),
-            "nav_begin": float(row["nav_begin"]) if pd.notna(row["nav_begin"]) else 0.0,
-            "nav_end": float(row["nav_end"]) if pd.notna(row["nav_end"]) else 0.0,
-            "period_calls": float(row["period_calls"]) if pd.notna(row["period_calls"]) else 0.0,
-            "period_dists": float(row["period_dists"]) if pd.notna(row["period_dists"]) else 0.0,
-        })
-    return pattern_dict
-
-
 def compute_pattern_dict_by_year(
     universe_df: pd.DataFrame, asset_class: str
 ) -> Dict[int, Dict[int, List[PatternRecord]]]:
@@ -330,133 +236,13 @@ def compute_pattern_dict_by_year(
 
 
 # ---------------------------------------------------------------------------
-# Initial fund-state sampling (fund-level, age-specific)
-# ---------------------------------------------------------------------------
-
-def build_initial_state_pool_by_age(
-    universe_df: pd.DataFrame,
-    asset_class: str,
-) -> Dict[int, List[Tuple[float, float]]]:
-    """Build age buckets of historical fund states for initialization.
-
-    Returns ``state_pool_by_age[age]`` -> list of tuples:
-    ``(nav_begin_multiple, cumulative_called_pct)`` where
-    * ``nav_begin_multiple`` = NAV-at-beginning-of-age / total_called
-    * ``cumulative_called_pct`` = cumulative called before that age / total_called
-    """
-    df = universe_df.copy()
-    df["asset_class_mapped"] = df["ASSET CLASS"].apply(map_universe_asset_class)
-    df = df[df["asset_class_mapped"] == asset_class].copy()
-    if df.empty:
-        return {}
-
-    df["transaction_year"] = pd.to_datetime(df["TRANSACTION DATE"], errors="coerce").dt.year
-    df["vintage_year"] = pd.to_numeric(df["VINTAGE / INCEPTION YEAR"], errors="coerce")
-    df["fund_age"] = df["transaction_year"] - df["vintage_year"] + 1
-    df = df[(df["fund_age"].notna()) & (df["fund_age"] > 0)].copy()
-
-    df["call_amount"] = np.where(
-        df["TRANSACTION TYPE"].str.lower().str.contains("capital call", na=False),
-        df["TRANSACTION AMOUNT"].abs(),
-        0.0,
-    )
-
-    total_called = df.groupby("FUND ID")["call_amount"].sum().rename("total_called")
-
-    vals = df[df["TRANSACTION TYPE"] == "Value"].copy()
-    vals["TRANSACTION DATE"] = pd.to_datetime(vals["TRANSACTION DATE"], errors="coerce")
-    nav_fa = (
-        vals.sort_values("TRANSACTION DATE")
-        .groupby(["FUND ID", "fund_age"])
-        .agg(nav_end=("TRANSACTION AMOUNT", "last"))
-        .reset_index()
-        .sort_values(["FUND ID", "fund_age"])
-    )
-    nav_fa["nav_begin"] = nav_fa.groupby("FUND ID")["nav_end"].shift(1).fillna(0.0)
-
-    calls_fa = (
-        df.groupby(["FUND ID", "fund_age"])["call_amount"]
-        .sum()
-        .reset_index(name="period_calls")
-        .sort_values(["FUND ID", "fund_age"])
-    )
-    calls_fa["cum_calls_before_age"] = (
-        calls_fa.groupby("FUND ID")["period_calls"].cumsum() - calls_fa["period_calls"]
-    )
-
-    state_df = nav_fa.merge(
-        calls_fa[["FUND ID", "fund_age", "cum_calls_before_age"]],
-        on=["FUND ID", "fund_age"],
-        how="left",
-    )
-    state_df = state_df.merge(total_called, on="FUND ID", how="left")
-    state_df["cum_calls_before_age"] = state_df["cum_calls_before_age"].fillna(0.0)
-    state_df = state_df[state_df["total_called"] > 0].copy()
-    if state_df.empty:
-        return {}
-
-    state_df["nav_begin_multiple"] = state_df["nav_begin"] / state_df["total_called"]
-    state_df["cumulative_called_pct"] = (
-        state_df["cum_calls_before_age"] / state_df["total_called"]
-    )
-    state_df["cumulative_called_pct"] = state_df["cumulative_called_pct"].clip(0.0, 1.0)
-    state_df["nav_begin_multiple"] = state_df["nav_begin_multiple"].clip(lower=0.0)
-
-    state_pool_by_age: Dict[int, List[Tuple[float, float]]] = {}
-    for _, row in state_df.iterrows():
-        age = int(row["fund_age"])
-        state_pool_by_age.setdefault(age, []).append(
-            (float(row["nav_begin_multiple"]), float(row["cumulative_called_pct"]))
-        )
-    return state_pool_by_age
-
-
-def sample_initial_fund_state_matrices(
-    ages: np.ndarray,
-    commitments: np.ndarray,
-    state_pool_by_age: Dict[int, List[Tuple[float, float]]],
-    num_simulations: int,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Sample initial NAV and cumulative-called state for each fund/simulation."""
-    import numpy as _np
-
-    if not state_pool_by_age:
-        raise ValueError("state_pool_by_age is empty")
-    max_age = max(state_pool_by_age.keys())
-
-    n_funds = len(ages)
-    initial_navs = _np.zeros((num_simulations, n_funds), dtype=float)
-    initial_cum_calls = _np.zeros((num_simulations, n_funds), dtype=float)
-
-    trunc_ages = _np.clip(ages.astype(int), 1, max_age)
-    for age_key in set(trunc_ages.tolist()):
-        idx = _np.where(trunc_ages == age_key)[0]
-        if idx.size == 0:
-            continue
-        pool = state_pool_by_age.get(age_key)
-        if not pool:
-            continue
-        nav_mult = _np.array([p[0] for p in pool], dtype=float)
-        cum_call_pct = _np.array([p[1] for p in pool], dtype=float)
-        L = len(pool)
-        ri = _np.random.randint(0, L, size=(num_simulations, idx.size))
-        comm = commitments[idx][None, :]
-        initial_navs[:, idx] = nav_mult[ri] * comm
-        initial_cum_calls[:, idx] = _np.minimum(cum_call_pct[ri] * comm, comm)
-
-    return initial_navs, initial_cum_calls
-
-
-# ---------------------------------------------------------------------------
 # Simulation engine – constant age, year-specific patterns
 # ---------------------------------------------------------------------------
 
 def run_simulation_constant_age_by_year(
     portfolio_df: pd.DataFrame,
-    patterns_by_year: Dict[int, Dict[int, List[PatternLike]]],
-    initial_state_pool_by_age: Dict[int, List[Tuple[float, float]]],
+    patterns_by_year: Dict[int, Dict[int, List[PatternRecord]]],
     scenario_years: Iterable[int],
-    base_year_end: int,
     num_simulations: int = 500,
     return_fund_level: bool = False,
     audit_simulation_number: Optional[int] = 0,
