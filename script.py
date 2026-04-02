@@ -614,6 +614,45 @@ def run_simulation_constant_age_by_year(
 
     # Fund names for reporting
     fund_names_list: List[str] = list(portfolio_df["fund_name"].to_numpy())
+
+    # ---- BOY record for initial state (before first scenario-year flows) ----
+    initial_manager_unfunded = float(commitments_initial.sum() - initial_cum_calls_vec.sum())
+    initial_lp_unfunded = lp_nav_purchase
+    initial_lp_reserve = initial_lp_unfunded - initial_manager_unfunded
+    for sim in range(num_simulations):
+        mgr_unfunded_pct_boy = (
+            initial_manager_unfunded / lp_nav_purchase if lp_nav_purchase > 0 else 1.0
+        )
+        lp_unfunded_pct_boy = initial_lp_unfunded / lp_nav_purchase if lp_nav_purchase > 0 else 1.0
+        lp_reserve_pct_boy = initial_lp_reserve / lp_nav_purchase if lp_nav_purchase > 0 else 1.0
+        agg_records.append({
+            "scenario_year": start_year,
+            "period_point": "BOY",
+            "simulation_number": sim,
+            "total_call": 0.0,
+            "total_distribution": 0.0,
+            "net_cashflow": 0.0,
+            "manager_unfunded_dollar": initial_manager_unfunded,
+            "manager_unfunded_pct": float(mgr_unfunded_pct_boy),
+            "nav_growth_pct": 0.0,
+            "invested_nav": lp_nav_purchase,
+            "fof_nav": lp_nav_purchase,
+            "recallable_balance": float(recallable_balance[sim]),
+            "recallable_dist": 0.0,
+            "recall": 0.0,
+            "lp_reserve_draw": 0.0,
+            "lp_unfunded_dollar": initial_lp_unfunded,
+            "lp_reserve_dollar": initial_lp_reserve,
+            "lp_reserve": initial_lp_reserve,
+            "lp_unfunded_pct": float(lp_unfunded_pct_boy),
+            "lp_reserve_pct": float(lp_reserve_pct_boy),
+            "lp_unfunded_breach": int(lp_unfunded_pct_boy < 0.20),
+            "cumulative_commitment": float(commitments_initial.sum()),
+            "cumulative_contributions": float(cum_calls_total[sim]),
+            "cumulative_distributions_total": float(cum_dists_total[sim]),
+            "underlying_unfunded_pct": float(mgr_unfunded_pct_boy),
+        })
+
     for year_idx, year in enumerate(scenario_years_list):
         # ---- Deploy new fund slots ----
         ns = n_active
@@ -753,10 +792,12 @@ def run_simulation_constant_age_by_year(
         for sim in range(num_simulations):
             agg_records.append({
                 "scenario_year": year,
+                "period_point": "EOY",
                 "simulation_number": sim,
                 "total_call": float(total_call[sim]),
                 "total_distribution": float(total_dist[sim]),
                 "net_cashflow": float(net_cf[sim]),
+                "manager_unfunded_dollar": float(running_commitment - cum_calls_total[sim]),
                 "manager_unfunded_pct": float(mgr_unfunded_pct[sim]),
                 "nav_growth_pct": float(avg_nav_growth[sim]),
                 "invested_nav": float(invested_nav[sim]),
@@ -765,8 +806,11 @@ def run_simulation_constant_age_by_year(
                 "recallable_dist": float(rec_dist[sim]),
                 "recall": float(recall[sim]),
                 "lp_reserve_draw": float(lp_draw[sim]),
+                "lp_unfunded_dollar": float(fof_nav[sim]),
+                "lp_reserve_dollar": float(lp_reserve[sim]),
                 "lp_reserve": float(lp_reserve[sim]),
                 "lp_unfunded_pct": float(lp_unfunded_pct[sim]),
+                "lp_reserve_pct": float(lp_reserve[sim] / fof_nav[sim]) if fof_nav[sim] > 0 else 1.0,
                 "lp_unfunded_breach": int(lp_breach[sim]),
                 "cumulative_commitment": running_commitment,
                 "cumulative_contributions": float(cum_calls_total[sim]),
@@ -809,6 +853,7 @@ def run_simulation_constant_age_by_year(
             sim_idx = int(audit_simulation_number)
             audit_year_df = pd.DataFrame({
                 "scenario_year": year,
+                "period_point": "EOY",
                 "simulation_number": sim_idx,
                 "fund_name": fund_names_list[:n_active],
                 "fund_age": ages,
@@ -1183,8 +1228,8 @@ def main():
         min_funds_per_vintage=10,
         commitment=commitment,
     )
-    # Start from the year after the initial snapshot vintage window end.
-    scenario_years = list(range(start_year + 1, end_year + 1))
+    # Include the start year so both BOY and EOY are recorded for that year.
+    scenario_years = list(range(start_year, end_year + 1))
 
     # ---- Run simulation ----
     if use_year_specific:
@@ -1240,12 +1285,14 @@ def main():
         "cumulative_commitment", "cumulative_contributions",
         "cumulative_distributions_total", "underlying_unfunded_pct",
     ]
-    summary = agg_df.groupby("scenario_year")[summary_cols].mean()
+    group_cols = ["scenario_year", "period_point"] if "period_point" in agg_df.columns else ["scenario_year"]
+    summary = agg_df.groupby(group_cols)[summary_cols].mean()
     print("\nAverage metrics by scenario year:")
     print(summary)
 
     lp_threshold = 0.20
-    breach_df = agg_df.groupby("scenario_year").apply(
+    breach_group_cols = ["scenario_year", "period_point"] if "period_point" in agg_df.columns else ["scenario_year"]
+    breach_df = agg_df.groupby(breach_group_cols).apply(
         lambda g: (g["lp_unfunded_pct"] < lp_threshold).mean() * 100
     ).rename("pct_sims_below_20pct")
     print(f"\nPercentage of simulations where LP Unfunded < {lp_threshold:.0%} by scenario year:")
