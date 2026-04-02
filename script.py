@@ -23,7 +23,7 @@ Key features
 
 import pandas as pd
 import numpy as np
-from typing import Any, Dict, List, Tuple, Optional, Iterable
+from typing import Any, Dict, List, Tuple, Optional, Iterable, Union
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -32,6 +32,49 @@ from pathlib import Path
 
 MIN_BUCKET_SIZE = 5  # Minimum observations per (year, age) bucket before fallback
 PatternRecord = Dict[str, Any]
+LegacyPatternTuple = Tuple[float, float, float]
+PatternLike = Union[PatternRecord, LegacyPatternTuple]
+
+
+def _coerce_pattern_record(
+    pattern: PatternLike,
+    age: Optional[int] = None,
+    transaction_year: Optional[int] = None,
+) -> PatternRecord:
+    """Normalize tuple/dict pattern payloads into a record shape."""
+    if isinstance(pattern, dict):
+        rec = dict(pattern)
+        if age is not None and rec.get("fund_age") is None:
+            rec["fund_age"] = age
+        if transaction_year is not None and rec.get("transaction_year") is None:
+            rec["transaction_year"] = transaction_year
+        rec.setdefault("fund_id", None)
+        rec.setdefault("fund_name", None)
+        rec.setdefault("vintage_year", None)
+        rec.setdefault("call_pct", 0.0)
+        rec.setdefault("dist_nav_pct", 0.0)
+        rec.setdefault("nav_growth_pct", 0.0)
+        rec.setdefault("nav_begin", 0.0)
+        rec.setdefault("nav_end", 0.0)
+        rec.setdefault("period_calls", 0.0)
+        rec.setdefault("period_dists", 0.0)
+        return rec
+
+    call_pct, dist_nav_pct, nav_growth_pct = pattern
+    return {
+        "fund_id": None,
+        "fund_name": None,
+        "vintage_year": None,
+        "fund_age": age,
+        "transaction_year": transaction_year,
+        "call_pct": float(call_pct),
+        "dist_nav_pct": float(dist_nav_pct),
+        "nav_growth_pct": float(nav_growth_pct),
+        "nav_begin": 0.0,
+        "nav_end": 0.0,
+        "period_calls": 0.0,
+        "period_dists": 0.0,
+    }
 
 # ---------------------------------------------------------------------------
 # Asset class mapping
@@ -291,7 +334,7 @@ def compute_pattern_dict_by_year(
 # ---------------------------------------------------------------------------
 
 def compute_initial_fund_navs(
-    pattern_dict: Dict[int, List[PatternRecord]],
+    pattern_dict: Dict[int, List[PatternLike]],
     ages: np.ndarray,
     commitments: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -311,10 +354,11 @@ def compute_initial_fund_navs(
 
     median_patterns: Dict[int, Tuple[float, float, float]] = {}
     for age_key, plist in pattern_dict.items():
+        recs = [_coerce_pattern_record(p, age=age_key) for p in plist]
         median_patterns[age_key] = (
-            float(np.median([p["call_pct"] for p in plist])),
-            float(np.median([p["dist_nav_pct"] for p in plist])),
-            float(np.median([p["nav_growth_pct"] for p in plist])),
+            float(np.median([p["call_pct"] for p in recs])),
+            float(np.median([p["dist_nav_pct"] for p in recs])),
+            float(np.median([p["nav_growth_pct"] for p in recs])),
         )
 
     n_funds = len(ages)
@@ -354,8 +398,8 @@ def compute_initial_fund_navs(
 
 def run_simulation_constant_age_by_year(
     portfolio_df: pd.DataFrame,
-    patterns_by_year: Dict[int, Dict[int, List[PatternRecord]]],
-    pattern_dict_fallback: Dict[int, List[PatternRecord]],
+    patterns_by_year: Dict[int, Dict[int, List[PatternLike]]],
+    pattern_dict_fallback: Dict[int, List[PatternLike]],
     scenario_years: Iterable[int],
     base_year_end: int,
     num_simulations: int = 500,
@@ -475,10 +519,10 @@ def run_simulation_constant_age_by_year(
         dnav_mat = _np.zeros((num_simulations, n_active), dtype=float)
         navg_mat = _np.zeros((num_simulations, n_active), dtype=float)
         sampled_nav_begin_mat = _np.zeros((num_simulations, n_active), dtype=float)
-        sampled_fund_id = _np.empty((num_simulations, n_active), dtype=object)
-        sampled_fund_name = _np.empty((num_simulations, n_active), dtype=object)
-        sampled_vintage_year = _np.empty((num_simulations, n_active), dtype=object)
-        sampled_txn_year = _np.empty((num_simulations, n_active), dtype=object)
+        sampled_fund_id = _np.full((num_simulations, n_active), None, dtype=object)
+        sampled_fund_name = _np.full((num_simulations, n_active), None, dtype=object)
+        sampled_vintage_year = _np.full((num_simulations, n_active), None, dtype=object)
+        sampled_txn_year = _np.full((num_simulations, n_active), None, dtype=object)
 
         for age_key in set(trunc_ages.tolist()):
             idx = _np.where(trunc_ages == age_key)[0]
@@ -489,6 +533,7 @@ def run_simulation_constant_age_by_year(
                 records = pattern_dict_fallback.get(age_key, [])
             if not records:
                 continue
+            records = [_coerce_pattern_record(r, age=age_key, transaction_year=year) for r in records]
             L = len(records)
             ri = _np.random.randint(0, L, size=(num_simulations, idx.size))
             for col_pos, fund_idx in enumerate(idx):
@@ -661,7 +706,7 @@ def run_simulation_constant_age_by_year(
 
 def run_simulation(
     portfolio_df: pd.DataFrame,
-    pattern_dict: Dict[int, List[PatternRecord]],
+    pattern_dict: Dict[int, List[PatternLike]],
     scenario_years: Iterable[int],
     num_simulations: int = 500,
     return_fund_level: bool = False,
@@ -714,7 +759,8 @@ def run_simulation(
 
     _median_call_curve_dyn: Dict[int, float] = {}
     for _ak, _pl in pattern_dict.items():
-        _median_call_curve_dyn[_ak] = float(_np.median([p["call_pct"] for p in _pl]))
+        _recs = [_coerce_pattern_record(p, age=_ak) for p in _pl]
+        _median_call_curve_dyn[_ak] = float(_np.median([p["call_pct"] for p in _recs]))
     _max_call_age_dyn = max(_median_call_curve_dyn.keys())
     commitment_vintages_dyn: List[Tuple[float, int]] = [(total_commitment, 0)]
 
@@ -747,6 +793,7 @@ def run_simulation(
             records = pattern_dict.get(age_key, [])
             if not records:
                 continue
+            records = [_coerce_pattern_record(r, age=age_key, transaction_year=year) for r in records]
             L = len(records)
             rand_idx = _np.random.randint(0, L, size=(num_simulations, idx.size))
             for col_pos, fund_idx in enumerate(idx):
@@ -892,10 +939,10 @@ def build_hypothetical_portfolio(
     return pd.DataFrame(records)
 
 
-def random_choice(options: List[PatternRecord]) -> PatternRecord:
+def random_choice(options: List[PatternLike]) -> PatternRecord:
     """Select a random element from a list of pattern records."""
     import random
-    return random.choice(options)
+    return _coerce_pattern_record(random.choice(options))
 
 
 # ---------------------------------------------------------------------------
