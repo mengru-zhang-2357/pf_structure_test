@@ -236,133 +236,13 @@ def compute_pattern_dict_by_year(
 
 
 # ---------------------------------------------------------------------------
-# Initial fund-state sampling (fund-level, age-specific)
-# ---------------------------------------------------------------------------
-
-def build_initial_state_pool_by_age(
-    universe_df: pd.DataFrame,
-    asset_class: str,
-) -> Dict[int, List[Tuple[float, float]]]:
-    """Build age buckets of historical fund states for initialization.
-
-    Returns ``state_pool_by_age[age]`` -> list of tuples:
-    ``(nav_begin_multiple, cumulative_called_pct)`` where
-    * ``nav_begin_multiple`` = NAV-at-beginning-of-age / total_called
-    * ``cumulative_called_pct`` = cumulative called before that age / total_called
-    """
-    df = universe_df.copy()
-    df["asset_class_mapped"] = df["ASSET CLASS"].apply(map_universe_asset_class)
-    df = df[df["asset_class_mapped"] == asset_class].copy()
-    if df.empty:
-        return {}
-
-    df["transaction_year"] = pd.to_datetime(df["TRANSACTION DATE"], errors="coerce").dt.year
-    df["vintage_year"] = pd.to_numeric(df["VINTAGE / INCEPTION YEAR"], errors="coerce")
-    df["fund_age"] = df["transaction_year"] - df["vintage_year"] + 1
-    df = df[(df["fund_age"].notna()) & (df["fund_age"] > 0)].copy()
-
-    df["call_amount"] = np.where(
-        df["TRANSACTION TYPE"].str.lower().str.contains("capital call", na=False),
-        df["TRANSACTION AMOUNT"].abs(),
-        0.0,
-    )
-
-    total_called = df.groupby("FUND ID")["call_amount"].sum().rename("total_called")
-
-    vals = df[df["TRANSACTION TYPE"] == "Value"].copy()
-    vals["TRANSACTION DATE"] = pd.to_datetime(vals["TRANSACTION DATE"], errors="coerce")
-    nav_fa = (
-        vals.sort_values("TRANSACTION DATE")
-        .groupby(["FUND ID", "fund_age"])
-        .agg(nav_end=("TRANSACTION AMOUNT", "last"))
-        .reset_index()
-        .sort_values(["FUND ID", "fund_age"])
-    )
-    nav_fa["nav_begin"] = nav_fa.groupby("FUND ID")["nav_end"].shift(1).fillna(0.0)
-
-    calls_fa = (
-        df.groupby(["FUND ID", "fund_age"])["call_amount"]
-        .sum()
-        .reset_index(name="period_calls")
-        .sort_values(["FUND ID", "fund_age"])
-    )
-    calls_fa["cum_calls_before_age"] = (
-        calls_fa.groupby("FUND ID")["period_calls"].cumsum() - calls_fa["period_calls"]
-    )
-
-    state_df = nav_fa.merge(
-        calls_fa[["FUND ID", "fund_age", "cum_calls_before_age"]],
-        on=["FUND ID", "fund_age"],
-        how="left",
-    )
-    state_df = state_df.merge(total_called, on="FUND ID", how="left")
-    state_df["cum_calls_before_age"] = state_df["cum_calls_before_age"].fillna(0.0)
-    state_df = state_df[state_df["total_called"] > 0].copy()
-    if state_df.empty:
-        return {}
-
-    state_df["nav_begin_multiple"] = state_df["nav_begin"] / state_df["total_called"]
-    state_df["cumulative_called_pct"] = (
-        state_df["cum_calls_before_age"] / state_df["total_called"]
-    )
-    state_df["cumulative_called_pct"] = state_df["cumulative_called_pct"].clip(0.0, 1.0)
-    state_df["nav_begin_multiple"] = state_df["nav_begin_multiple"].clip(lower=0.0)
-
-    state_pool_by_age: Dict[int, List[Tuple[float, float]]] = {}
-    for _, row in state_df.iterrows():
-        age = int(row["fund_age"])
-        state_pool_by_age.setdefault(age, []).append(
-            (float(row["nav_begin_multiple"]), float(row["cumulative_called_pct"]))
-        )
-    return state_pool_by_age
-
-
-def sample_initial_fund_state_matrices(
-    ages: np.ndarray,
-    commitments: np.ndarray,
-    state_pool_by_age: Dict[int, List[Tuple[float, float]]],
-    num_simulations: int,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Sample initial NAV and cumulative-called state for each fund/simulation."""
-    import numpy as _np
-
-    if not state_pool_by_age:
-        raise ValueError("state_pool_by_age is empty")
-    max_age = max(state_pool_by_age.keys())
-
-    n_funds = len(ages)
-    initial_navs = _np.zeros((num_simulations, n_funds), dtype=float)
-    initial_cum_calls = _np.zeros((num_simulations, n_funds), dtype=float)
-
-    trunc_ages = _np.clip(ages.astype(int), 1, max_age)
-    for age_key in set(trunc_ages.tolist()):
-        idx = _np.where(trunc_ages == age_key)[0]
-        if idx.size == 0:
-            continue
-        pool = state_pool_by_age.get(age_key)
-        if not pool:
-            continue
-        nav_mult = _np.array([p[0] for p in pool], dtype=float)
-        cum_call_pct = _np.array([p[1] for p in pool], dtype=float)
-        L = len(pool)
-        ri = _np.random.randint(0, L, size=(num_simulations, idx.size))
-        comm = commitments[idx][None, :]
-        initial_navs[:, idx] = nav_mult[ri] * comm
-        initial_cum_calls[:, idx] = _np.minimum(cum_call_pct[ri] * comm, comm)
-
-    return initial_navs, initial_cum_calls
-
-
-# ---------------------------------------------------------------------------
 # Simulation engine – constant age, year-specific patterns
 # ---------------------------------------------------------------------------
 
 def run_simulation_constant_age_by_year(
     portfolio_df: pd.DataFrame,
     patterns_by_year: Dict[int, Dict[int, List[PatternRecord]]],
-    initial_state_pool_by_age: Dict[int, List[Tuple[float, float]]],
     scenario_years: Iterable[int],
-    base_year_end: int,
     num_simulations: int = 500,
     return_fund_level: bool = False,
     audit_simulation_number: Optional[int] = 0,
@@ -881,15 +761,12 @@ def main():
 
     # ---- Run year-specific persistent-fund simulation ----
     patterns_by_year = compute_pattern_dict_by_year(universe_df, asset_class)
-    initial_state_pool_by_age = build_initial_state_pool_by_age(universe_df, asset_class)
     if not patterns_by_year:
         raise RuntimeError(f"No year-specific patterns for {asset_class!r}")
     fund_df, agg_df, audit_df = run_simulation_constant_age_by_year(
         portfolio_df=portfolio_df,
         patterns_by_year=patterns_by_year,
-        initial_state_pool_by_age=initial_state_pool_by_age,
         scenario_years=scenario_years,
-        base_year_end=end_year,
         num_simulations=simulations,
         return_fund_level=False,
         audit_simulation_number=audit_simulation_number,
