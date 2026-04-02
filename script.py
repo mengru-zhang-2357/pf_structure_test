@@ -472,10 +472,10 @@ def run_simulation_constant_age_by_year(
     an equal amount as reserve.
 
     **Dynamic aging:**
-    All funds age dynamically.  Burn-in funds start at their projected
-    age and advance by 1 each simulation year; new fund slots start at
-    age 1.  Each simulation year, 10 new fund slots are created to
-    deploy the annual commitment ($1 x funds_per_vintage = $10).
+    All funds age dynamically. Burn-in funds start at their age as of
+    the first scenario year and advance by 1 each simulation year; new
+    fund slots start at age 1. New fund slots are added each simulation
+    year.
 
     **Recallable distributions:**
     * Excess cash (dists > calls) is paid to the LP as a recallable
@@ -491,13 +491,16 @@ def run_simulation_constant_age_by_year(
     max_age_global = max(pattern_dict_fallback.keys())
 
     scenario_years_list = list(scenario_years)
+    if not scenario_years_list:
+        raise ValueError("scenario_years is empty")
+    start_year = scenario_years_list[0]
     n_scenario_years = len(scenario_years_list)
 
     # ---- Portfolio setup ----
     n_initial = len(portfolio_df)
     commitments_initial = portfolio_df["commitment"].to_numpy(dtype=float)
     vintage_years_initial = portfolio_df["vintage_year"].to_numpy(dtype=int)
-    burnin_ages = base_year_end - vintage_years_initial + 1
+    burnin_ages = _np.maximum(start_year - vintage_years_initial + 1, 1)
 
     # Infer pacing parameters from portfolio structure
     funds_per_vintage = int(
@@ -996,17 +999,19 @@ def build_hypothetical_portfolio(
 def build_sampled_portfolio_from_universe(
     universe_df: pd.DataFrame,
     asset_class: str,
-    base_year_end: int = 2025,
+    portfolio_end_vintage_year: int = 2025,
     n_vintages: int = 20,
     n_per_vintage: int = 10,
+    min_funds_per_vintage: int = 10,
     commitment: float = 1.0,
     random_state: Optional[int] = None,
 ) -> pd.DataFrame:
     """Build a portfolio by sampling real funds from the raw universe.
 
-    Samples ``n_per_vintage`` funds for each of the last ``n_vintages`` vintages
-    ending at ``base_year_end``. If a vintage has fewer than ``n_per_vintage``
-    unique funds available, sampling is done with replacement.
+    Samples funds for each of the last ``n_vintages`` vintages ending at
+    ``portfolio_end_vintage_year``. For each vintage, draws
+    ``max(n_per_vintage, min_funds_per_vintage)`` funds. If a vintage has fewer
+    unique funds than the target size, sampling is done with replacement.
     """
     rng = np.random.default_rng(random_state)
 
@@ -1033,16 +1038,17 @@ def build_sampled_portfolio_from_universe(
     if fund_pool.empty:
         raise RuntimeError("No distinct funds available after filtering universe data")
 
-    vintage_start_year = base_year_end - n_vintages + 1
-    target_vintages = list(range(vintage_start_year, base_year_end + 1))
+    target_size = max(int(n_per_vintage), int(min_funds_per_vintage))
+    vintage_start_year = portfolio_end_vintage_year - n_vintages + 1
+    target_vintages = list(range(vintage_start_year, portfolio_end_vintage_year + 1))
 
     sampled_frames: List[pd.DataFrame] = []
     for vintage_year in target_vintages:
         vintage_funds = fund_pool[fund_pool["vintage_year"] == vintage_year]
         if vintage_funds.empty:
             raise RuntimeError(f"No funds found for vintage {vintage_year} and asset class {asset_class!r}")
-        replace = len(vintage_funds) < n_per_vintage
-        sampled_idx = rng.choice(vintage_funds.index.to_numpy(), size=n_per_vintage, replace=replace)
+        replace = len(vintage_funds) < target_size
+        sampled_idx = rng.choice(vintage_funds.index.to_numpy(), size=target_size, replace=replace)
         sampled_frames.append(vintage_funds.loc[sampled_idx].copy())
 
     portfolio_df = pd.concat(sampled_frames, ignore_index=True)
@@ -1089,7 +1095,8 @@ def main():
     asset_class = "Venture Capital"
     n_vintages = 20
     n_per_vintage = 10
-    base_year_end = 2025
+    start_year = 2006
+    end_year = 2025
     commitment = 1.0
     simulations = 5000
     output_path = r"./output"
@@ -1104,12 +1111,14 @@ def main():
     portfolio_df = build_sampled_portfolio_from_universe(
         universe_df=universe_df,
         asset_class=asset_class,
-        base_year_end=base_year_end,
+        portfolio_end_vintage_year=start_year,
         n_vintages=n_vintages,
         n_per_vintage=n_per_vintage,
+        min_funds_per_vintage=10,
         commitment=commitment,
     )
-    scenario_years = list(range(base_year_end - n_vintages + 1, base_year_end + 1))
+    # Start from the year after the initial snapshot vintage window end.
+    scenario_years = list(range(start_year + 1, end_year + 1))
 
     # ---- Run simulation ----
     if use_year_specific:
@@ -1124,7 +1133,7 @@ def main():
             pattern_dict_fallback=pattern_dict_fallback,
             initial_state_pool_by_age=initial_state_pool_by_age,
             scenario_years=scenario_years,
-            base_year_end=base_year_end,
+            base_year_end=end_year,
             num_simulations=simulations,
             return_fund_level=False,
             audit_simulation_number=audit_simulation_number,
