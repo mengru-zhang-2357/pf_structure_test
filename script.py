@@ -455,6 +455,7 @@ def run_simulation_constant_age_by_year(
     portfolio_df: pd.DataFrame,
     patterns_by_year: Dict[int, Dict[int, List[PatternLike]]],
     pattern_dict_fallback: Dict[int, List[PatternLike]],
+    initial_state_pool_by_age: Dict[int, List[Tuple[float, float]]],
     scenario_years: Iterable[int],
     base_year_end: int,
     num_simulations: int = 500,
