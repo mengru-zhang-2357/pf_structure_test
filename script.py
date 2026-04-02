@@ -488,9 +488,6 @@ def run_simulation_constant_age_by_year(
 
     if "fund_id" not in portfolio_df.columns:
         raise ValueError("portfolio_df must include 'fund_id' for persistent fund-identity simulation")
-    if not initial_state_pool_by_age:
-        raise ValueError("initial_state_pool_by_age is empty")
-    max_age_global = max(initial_state_pool_by_age.keys())
 
     scenario_years_list = list(scenario_years)
     if not scenario_years_list:
@@ -521,21 +518,63 @@ def run_simulation_constant_age_by_year(
     creation_years = _np.zeros(n_max, dtype=int)
     creation_years[:n_initial] = -1  # sentinel: burn-in fund
 
-    # ---- Existing-fund initialization from sampled historical states ----
-    initial_navs, initial_cum_calls = sample_initial_fund_state_matrices(
-        burnin_ages, commitments_initial, initial_state_pool_by_age, num_simulations,
-    )
-    lp_nav_purchase = float(initial_navs.sum(axis=1).mean())
+    fund_level_records: List[pd.DataFrame] = []
+    agg_records: List[Dict[str, object]] = []
+    audit_records: List[Dict[str, object]] = []
+
+    # Build lookup tables for persistent fund-level paths.
+    fund_year_record: Dict[Tuple[object, int], PatternRecord] = {}
+    fund_meta: Dict[object, Dict[str, object]] = {}
+    fund_ids_by_vintage: Dict[int, List[object]] = {}
+    fund_call_curve: Dict[object, Dict[int, float]] = {}
+    for year, ages_map in patterns_by_year.items():
+        for _, records in ages_map.items():
+            for raw in records:
+                rec = _coerce_pattern_record(raw)
+                fund_id = rec.get("fund_id")
+                if fund_id is None:
+                    continue
+                year_key = int(year)
+                fund_year_record[(fund_id, year_key)] = rec
+                fund_call_curve.setdefault(fund_id, {})[year_key] = float(rec.get("call_pct", 0.0))
+                meta = fund_meta.setdefault(fund_id, {})
+                if meta.get("fund_name") is None and rec.get("fund_name") is not None:
+                    meta["fund_name"] = rec.get("fund_name")
+                if meta.get("vintage_year") is None and rec.get("vintage_year") is not None:
+                    meta["vintage_year"] = int(rec.get("vintage_year"))
+                vy = rec.get("vintage_year")
+                if vy is not None and pd.notna(vy):
+                    fund_ids_by_vintage.setdefault(int(vy), []).append(fund_id)
+
+    fund_ids_by_vintage = {
+        vy: list(dict.fromkeys(ids)) for vy, ids in fund_ids_by_vintage.items()
+    }
+    if not fund_ids_by_vintage:
+        raise ValueError("patterns_by_year has no fund_id/vintage_year information")
+
+    # ---- Existing-fund initialization from selected fund identities (deterministic) ----
+    initial_navs_vec = _np.zeros(n_initial, dtype=float)
+    initial_cum_calls_vec = _np.zeros(n_initial, dtype=float)
+    for i, fid in enumerate(initial_fund_ids):
+        rec_start = fund_year_record.get((fid, int(start_year)))
+        if rec_start is not None:
+            initial_navs_vec[i] = float(rec_start.get("nav_begin", 0.0))
+
+        hist_calls = fund_call_curve.get(fid, {})
+        called_pct_before_start = float(sum(v for y, v in hist_calls.items() if y < int(start_year)))
+        called_pct_before_start = float(_np.clip(called_pct_before_start, 0.0, 1.0))
+        initial_cum_calls_vec[i] = commitments_initial[i] * called_pct_before_start
+
+    initial_navs = _np.broadcast_to(initial_navs_vec, (num_simulations, n_initial)).copy()
+    initial_cum_calls = _np.broadcast_to(initial_cum_calls_vec, (num_simulations, n_initial)).copy()
+
+    lp_nav_purchase = float(initial_navs_vec.sum())
     print(f"Projected portfolio NAV (initial state): ${lp_nav_purchase:.2f}")
     print(f"  LP purchase price = ${lp_nav_purchase:.2f}")
     print(f"  LP reserve (50%) = ${lp_nav_purchase:.2f}")
     print(f"  LP total commitment = ${2 * lp_nav_purchase:.2f}")
     print(f"  Initial fund commitments = ${commitments_initial.sum():.2f}")
     print(f"  New commitment per year = ${funds_per_vintage * new_fund_commitment:.2f}")
-
-    fund_level_records: List[pd.DataFrame] = []
-    agg_records: List[Dict[str, object]] = []
-    audit_records: List[Dict[str, object]] = []
 
     # ---- Initialise simulation state (pre-allocated for max size) ----
     cum_calls_pf = _np.zeros((num_simulations, n_max), dtype=float)
@@ -553,34 +592,6 @@ def run_simulation_constant_age_by_year(
 
     n_active = n_initial
     running_commitment = float(commitments_initial.sum())
-
-    # Build lookup tables for persistent fund-level paths.
-    fund_year_record: Dict[Tuple[object, int], PatternRecord] = {}
-    fund_meta: Dict[object, Dict[str, object]] = {}
-    fund_ids_by_vintage: Dict[int, List[object]] = {}
-    for year, ages_map in patterns_by_year.items():
-        for _, records in ages_map.items():
-            for raw in records:
-                rec = _coerce_pattern_record(raw)
-                fund_id = rec.get("fund_id")
-                if fund_id is None:
-                    continue
-                year_key = int(year)
-                fund_year_record[(fund_id, year_key)] = rec
-                meta = fund_meta.setdefault(fund_id, {})
-                if meta.get("fund_name") is None and rec.get("fund_name") is not None:
-                    meta["fund_name"] = rec.get("fund_name")
-                if meta.get("vintage_year") is None and rec.get("vintage_year") is not None:
-                    meta["vintage_year"] = int(rec.get("vintage_year"))
-                vy = rec.get("vintage_year")
-                if vy is not None and pd.notna(vy):
-                    fund_ids_by_vintage.setdefault(int(vy), []).append(fund_id)
-
-    fund_ids_by_vintage = {
-        vy: list(dict.fromkeys(ids)) for vy, ids in fund_ids_by_vintage.items()
-    }
-    if not fund_ids_by_vintage:
-        raise ValueError("patterns_by_year has no fund_id/vintage_year information")
 
     # Per-simulation slot assignments.
     slot_fund_ids = _np.full((num_simulations, n_max), None, dtype=object)
@@ -618,7 +629,6 @@ def run_simulation_constant_age_by_year(
             ages[n_initial:n_active] = (
                 year - creation_years[n_initial:n_active] + 1
             )
-        trunc_ages = _np.clip(ages, 1, max_age_global)
 
         # ---- Pull persistent fund-level records for all active slots ----
         call_mat = _np.zeros((num_simulations, n_active), dtype=float)
@@ -637,7 +647,7 @@ def run_simulation_constant_age_by_year(
                 rec = fund_year_record.get((fid, int(year)))
                 if rec is None:
                     continue
-                rec = _coerce_pattern_record(rec, age=int(trunc_ages[fund_idx]), transaction_year=int(year))
+                rec = _coerce_pattern_record(rec, age=int(ages[fund_idx]), transaction_year=int(year))
                 mask = (fund_ids_col == fid)
                 call_mat[mask, fund_idx] = float(rec["call_pct"])
                 dnav_mat[mask, fund_idx] = float(rec["dist_nav_pct"])
@@ -662,7 +672,7 @@ def run_simulation_constant_age_by_year(
             (creation_years[:n_active] == year)[None, :],
             nav_begin.shape,
         )
-        nav_begin = _np.where(new_fund_mask & (nav_begin <= 0), sampled_nav_begin_mat, nav_begin)
+        nav_begin = _np.where(new_fund_mask, 0.0, nav_begin)
         nav_pf[:, :n_active] = nav_begin
         nav_total_begin = nav_begin.sum(axis=1)
 
