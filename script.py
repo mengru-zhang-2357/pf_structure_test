@@ -601,9 +601,9 @@ def run_simulation_constant_age_by_year(
     cum_calls_total = cum_calls_pf[:, :n_initial].sum(axis=1).copy()
     cum_dists_total = _np.zeros(num_simulations, dtype=float)
 
-    # LP economics
-    lp_reserve = _np.full(num_simulations, lp_nav_purchase, dtype=float)
-    recallable_balance = _np.zeros(num_simulations, dtype=float)
+    # LP economics (dollar terms)
+    lp_unfunded = _np.full(num_simulations, lp_nav_purchase, dtype=float)
+    sim_active = _np.ones(num_simulations, dtype=bool)
 
     n_active = n_initial
     running_commitment = float(commitments_initial.sum())
@@ -614,7 +614,37 @@ def run_simulation_constant_age_by_year(
 
     # Fund names for reporting
     fund_names_list: List[str] = list(portfolio_df["fund_name"].to_numpy())
+    initial_year = int(min(scenario_years_list) - 1)
+    initial_manager_unfunded = _np.maximum(
+        commitments_initial.sum() - initial_cum_calls.sum(axis=1),
+        0.0,
+    )
+    initial_lp_reserve = lp_unfunded - initial_manager_unfunded
+    initial_lp_nav = initial_navs.sum(axis=1)
+    for sim in range(num_simulations):
+        agg_records.append({
+            "scenario_year": initial_year,
+            "period_point": "BOY",
+            "simulation_number": sim,
+            "lp_nav": float(initial_lp_nav[sim]),
+            "manager_unfunded_dollar": float(initial_manager_unfunded[sim]),
+            "lp_unfunded_dollar": float(lp_unfunded[sim]),
+            "lp_reserve_dollar": float(initial_lp_reserve[sim]),
+            "manager_unfunded_pct": float(
+                initial_manager_unfunded[sim] / initial_lp_nav[sim]
+            ) if initial_lp_nav[sim] > 0 else float("nan"),
+            "lp_unfunded_pct": float(
+                lp_unfunded[sim] / initial_lp_nav[sim]
+            ) if initial_lp_nav[sim] > 0 else float("nan"),
+            "lp_reserve_pct": float(
+                initial_lp_reserve[sim] / initial_lp_nav[sim]
+            ) if initial_lp_nav[sim] > 0 else float("nan"),
+            "lp_unfunded_exhausted": int(lp_unfunded[sim] <= 0.0),
+        })
     for year_idx, year in enumerate(scenario_years_list):
+        if not _np.any(sim_active):
+            print(f"all simulations exhausted LP unfunded before year {year}; stopping roll-forward")
+            break
         # ---- Deploy new fund slots ----
         ns = n_active
         ne = n_active + funds_per_vintage
@@ -679,6 +709,7 @@ def run_simulation_constant_age_by_year(
         remaining = c_all - cum_calls_pf[:, :n_active]
         remaining = _np.maximum(remaining, 0.0)
         call_amounts = _np.minimum(call_amounts, remaining)
+        call_amounts = _np.where(sim_active[:, None], call_amounts, 0.0)
         cum_calls_pf[:, :n_active] += call_amounts
 
         # ---- NAV snapshot ----
@@ -704,12 +735,14 @@ def run_simulation_constant_age_by_year(
         dist_amounts = _np.minimum(
             dist_amounts, _np.maximum(nav_begin, 0.0)
         )
+        dist_amounts = _np.where(sim_active[:, None], dist_amounts, 0.0)
 
         # Update underlying fund NAVs
         nav_pf[:, :n_active] = (
             nav_pf[:, :n_active] * (1.0 + navg_mat)
             + call_amounts - dist_amounts
         )
+        nav_pf[:, :n_active] = _np.where(sim_active[:, None], nav_pf[:, :n_active], nav_begin)
         nav_pf[:, :n_active] = _np.maximum(nav_pf[:, :n_active], 0.0)
         nav_end = nav_pf[:, :n_active].copy()
 
@@ -721,53 +754,80 @@ def run_simulation_constant_age_by_year(
         cum_calls_total += total_call
         cum_dists_total += total_dist
 
-        mgr_unfunded_pct = _np.where(
-            running_commitment > 0,
-            (running_commitment - cum_calls_total) / running_commitment,
-            _np.ones(num_simulations),
-        )
-
-        # ---- Recallable distribution mechanics ----
-        rec_dist = _np.maximum(net_cf, 0.0)
-        recallable_balance += rec_dist
-
-        shortfall = _np.maximum(-net_cf, 0.0)
-        recall = _np.minimum(shortfall, recallable_balance)
-        recallable_balance -= recall
-        lp_draw = shortfall - recall
-        lp_reserve -= lp_draw
-
         # ---- FoF NAV = invested NAV only (no cash) ----
         invested_nav = nav_pf[:, :n_active].sum(axis=1)
         fof_nav = invested_nav
 
-        # ---- LP Unfunded % ----
-        lp_denom = fof_nav + lp_reserve
-        lp_unfunded_pct = _np.where(
-            lp_denom > 0,
-            lp_reserve / lp_denom,
-            _np.ones(num_simulations),
+        # ---- BOY / EOY unfunded & reserve mechanics ----
+        manager_unfunded_boy = _np.maximum(
+            commitments_all[:n_active].sum() - (cum_calls_pf[:, :n_active] - call_amounts).sum(axis=1),
+            0.0,
         )
-        lp_breach = _np.where(lp_unfunded_pct < 0.20, 1, 0)
+        manager_unfunded_eoy = _np.maximum(
+            commitments_all[:n_active].sum() - cum_calls_pf[:, :n_active].sum(axis=1),
+            0.0,
+        )
+
+        lp_unfunded_eoy = lp_unfunded + net_cf
+        lp_unfunded_eoy = _np.maximum(lp_unfunded_eoy, 0.0)
+        lp_unfunded_eoy = _np.where(sim_active, lp_unfunded_eoy, lp_unfunded)
+
+        lp_nav_boy = nav_total_begin
+        lp_nav_eoy = fof_nav
+
+        lp_reserve_boy = lp_unfunded - manager_unfunded_boy
+        lp_reserve_eoy = lp_unfunded_eoy - manager_unfunded_eoy
+
+        lp_unfunded_pct_boy = _np.where(lp_nav_boy > 0, lp_unfunded / lp_nav_boy, _np.nan)
+        manager_unfunded_pct_boy = _np.where(lp_nav_boy > 0, manager_unfunded_boy / lp_nav_boy, _np.nan)
+        lp_reserve_pct_boy = _np.where(lp_nav_boy > 0, lp_reserve_boy / lp_nav_boy, _np.nan)
+
+        lp_unfunded_pct_eoy = _np.where(lp_nav_eoy > 0, lp_unfunded_eoy / lp_nav_eoy, _np.nan)
+        manager_unfunded_pct_eoy = _np.where(lp_nav_eoy > 0, manager_unfunded_eoy / lp_nav_eoy, _np.nan)
+        lp_reserve_pct_eoy = _np.where(lp_nav_eoy > 0, lp_reserve_eoy / lp_nav_eoy, _np.nan)
+
+        lp_breach = _np.where(lp_unfunded_pct_eoy < 0.20, 1, 0)
 
         for sim in range(num_simulations):
+            if not sim_active[sim]:
+                continue
             agg_records.append({
                 "scenario_year": year,
+                "period_point": "BOY",
+                "simulation_number": sim,
+                "lp_nav": float(lp_nav_boy[sim]),
+                "manager_unfunded_dollar": float(manager_unfunded_boy[sim]),
+                "lp_unfunded_dollar": float(lp_unfunded[sim]),
+                "lp_reserve_dollar": float(lp_reserve_boy[sim]),
+                "manager_unfunded_pct": float(manager_unfunded_pct_boy[sim]),
+                "lp_unfunded_pct": float(lp_unfunded_pct_boy[sim]),
+                "lp_reserve_pct": float(lp_reserve_pct_boy[sim]),
+                "lp_unfunded_exhausted": int(lp_unfunded[sim] <= 0.0),
+            })
+            agg_records.append({
+                "scenario_year": year,
+                "period_point": "EOY",
                 "simulation_number": sim,
                 "total_call": float(total_call[sim]),
                 "total_distribution": float(total_dist[sim]),
                 "net_cashflow": float(net_cf[sim]),
-                "manager_unfunded_pct": float(mgr_unfunded_pct[sim]),
+                "manager_unfunded_dollar": float(manager_unfunded_eoy[sim]),
+                "lp_unfunded_dollar": float(lp_unfunded_eoy[sim]),
+                "lp_reserve_dollar": float(lp_reserve_eoy[sim]),
+                "manager_unfunded_pct": float(manager_unfunded_pct_eoy[sim]),
                 "nav_growth_pct": float(avg_nav_growth[sim]),
                 "invested_nav": float(invested_nav[sim]),
                 "fof_nav": float(fof_nav[sim]),
-                "recallable_balance": float(recallable_balance[sim]),
-                "recallable_dist": float(rec_dist[sim]),
-                "recall": float(recall[sim]),
-                "lp_reserve_draw": float(lp_draw[sim]),
-                "lp_reserve": float(lp_reserve[sim]),
-                "lp_unfunded_pct": float(lp_unfunded_pct[sim]),
+                "lp_nav": float(lp_nav_eoy[sim]),
+                "recallable_balance": 0.0,
+                "recallable_dist": 0.0,
+                "recall": 0.0,
+                "lp_reserve_draw": 0.0,
+                "lp_reserve": float(lp_reserve_eoy[sim]),
+                "lp_unfunded_pct": float(lp_unfunded_pct_eoy[sim]),
+                "lp_reserve_pct": float(lp_reserve_pct_eoy[sim]),
                 "lp_unfunded_breach": int(lp_breach[sim]),
+                "lp_unfunded_exhausted": int(lp_unfunded_eoy[sim] <= 0.0),
                 "cumulative_commitment": running_commitment,
                 "cumulative_contributions": float(cum_calls_total[sim]),
                 "cumulative_distributions_total": float(cum_dists_total[sim]),
@@ -777,6 +837,9 @@ def run_simulation_constant_age_by_year(
                     if running_commitment > 0 else 1.0
                 ),
             })
+
+        lp_unfunded = lp_unfunded_eoy
+        sim_active = _np.logical_and(sim_active, lp_unfunded > 0.0)
 
         if return_fund_level:
             nr = num_simulations * n_active
