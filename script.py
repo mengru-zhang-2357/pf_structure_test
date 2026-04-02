@@ -527,6 +527,7 @@ def run_simulation_constant_age_by_year(
     fund_meta: Dict[object, Dict[str, object]] = {}
     fund_ids_by_vintage: Dict[int, List[object]] = {}
     fund_call_curve: Dict[object, Dict[int, float]] = {}
+    fund_total_called: Dict[object, float] = {}
     for year, ages_map in patterns_by_year.items():
         for _, records in ages_map.items():
             for raw in records:
@@ -537,6 +538,9 @@ def run_simulation_constant_age_by_year(
                 year_key = int(year)
                 fund_year_record[(fund_id, year_key)] = rec
                 fund_call_curve.setdefault(fund_id, {})[year_key] = float(rec.get("call_pct", 0.0))
+                fund_total_called[fund_id] = fund_total_called.get(fund_id, 0.0) + float(
+                    rec.get("period_calls", 0.0)
+                )
                 meta = fund_meta.setdefault(fund_id, {})
                 if meta.get("fund_name") is None and rec.get("fund_name") is not None:
                     meta["fund_name"] = rec.get("fund_name")
@@ -558,7 +562,10 @@ def run_simulation_constant_age_by_year(
     for i, fid in enumerate(initial_fund_ids):
         rec_start = fund_year_record.get((fid, int(start_year)))
         if rec_start is not None:
-            initial_navs_vec[i] = float(rec_start.get("nav_begin", 0.0))
+            total_called = float(fund_total_called.get(fid, 0.0))
+            nav_begin = float(rec_start.get("nav_begin", 0.0))
+            nav_begin_multiple = (nav_begin / total_called) if total_called > 0 else 0.0
+            initial_navs_vec[i] = nav_begin_multiple * commitments_initial[i]
 
         hist_calls = fund_call_curve.get(fid, {})
         called_pct_before_start = float(sum(v for y, v in hist_calls.items() if y < int(start_year)))
@@ -569,7 +576,15 @@ def run_simulation_constant_age_by_year(
     initial_cum_calls = _np.broadcast_to(initial_cum_calls_vec, (num_simulations, n_initial)).copy()
 
     lp_nav_purchase = float(initial_navs_vec.sum())
+    nav_per_commitment = _np.divide(
+        initial_navs_vec,
+        commitments_initial,
+        out=_np.zeros_like(initial_navs_vec),
+        where=commitments_initial > 0,
+    )
+    median_initial_nav_per_commitment = float(_np.median(nav_per_commitment))
     print(f"Projected portfolio NAV (initial state): ${lp_nav_purchase:.2f}")
+    print(f"  Median initial NAV per $1 commitment = ${median_initial_nav_per_commitment:.4f}")
     print(f"  LP purchase price = ${lp_nav_purchase:.2f}")
     print(f"  LP reserve (50%) = ${lp_nav_purchase:.2f}")
     print(f"  LP total commitment = ${2 * lp_nav_purchase:.2f}")
