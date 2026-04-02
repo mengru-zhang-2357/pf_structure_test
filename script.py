@@ -833,6 +833,62 @@ def build_hypothetical_portfolio(
             })
     return pd.DataFrame(records)
 
+def build_sampled_portfolio_from_universe(
+    universe_df: pd.DataFrame,
+    asset_class: str,
+    base_year_end: int = 2025,
+    n_vintages: int = 20,
+    n_per_vintage: int = 10,
+    commitment: float = 1.0,
+    random_state: Optional[int] = None,
+) -> pd.DataFrame:
+    """Build a portfolio by sampling real funds from the raw universe.
+
+    Samples ``n_per_vintage`` funds for each of the last ``n_vintages`` vintages
+    ending at ``base_year_end``. If a vintage has fewer than ``n_per_vintage``
+    unique funds available, sampling is done with replacement.
+    """
+    rng = np.random.default_rng(random_state)
+
+    df = universe_df.copy()
+    df["asset_class_mapped"] = df["ASSET CLASS"].apply(map_universe_asset_class)
+    df = df[df["asset_class_mapped"] == asset_class].copy()
+    if df.empty:
+        raise RuntimeError(f"No universe rows found for asset class {asset_class!r}")
+
+    df["vintage_year"] = pd.to_numeric(df["VINTAGE / INCEPTION YEAR"], errors="coerce")
+    df = df[df["vintage_year"].notna()].copy()
+    df["vintage_year"] = df["vintage_year"].astype(int)
+
+    fund_name_col = "FUND NAME" if "FUND NAME" in df.columns else "FUND"
+    if fund_name_col not in df.columns:
+        raise RuntimeError("Expected a fund name column ('FUND NAME' or 'FUND') in universe data")
+
+    fund_pool = (
+        df[["FUND ID", fund_name_col, "vintage_year"]]
+        .dropna(subset=["FUND ID", fund_name_col])
+        .drop_duplicates(subset=["FUND ID", "vintage_year"])
+        .rename(columns={fund_name_col: "fund_name", "FUND ID": "fund_id"})
+    )
+    if fund_pool.empty:
+        raise RuntimeError("No distinct funds available after filtering universe data")
+
+    vintage_start_year = base_year_end - n_vintages + 1
+    target_vintages = list(range(vintage_start_year, base_year_end + 1))
+
+    sampled_frames: List[pd.DataFrame] = []
+    for vintage_year in target_vintages:
+        vintage_funds = fund_pool[fund_pool["vintage_year"] == vintage_year]
+        if vintage_funds.empty:
+            raise RuntimeError(f"No funds found for vintage {vintage_year} and asset class {asset_class!r}")
+        replace = len(vintage_funds) < n_per_vintage
+        sampled_idx = rng.choice(vintage_funds.index.to_numpy(), size=n_per_vintage, replace=replace)
+        sampled_frames.append(vintage_funds.loc[sampled_idx].copy())
+
+    portfolio_df = pd.concat(sampled_frames, ignore_index=True)
+    portfolio_df["commitment"] = float(commitment)
+    return portfolio_df[["fund_name", "fund_id", "vintage_year", "commitment"]]
+
 
 def random_choice(options: List[Tuple[float, float, float]]) -> Tuple[float, float, float]:
     """Select a random element from a list of pattern tuples."""
@@ -872,7 +928,7 @@ def main():
     universe_path = r"./data/Preqin_Cashflow_export.xlsx"
     asset_class = "Venture Capital"
     n_vintages = 20
-    funds_per_vintage = 10
+    n_per_vintage = 10
     base_year_end = 2025
     commitment = 1.0
     simulations = 5000
@@ -885,8 +941,13 @@ def main():
     use_year_specific = True
 
     # ---- Build portfolio ----
-    portfolio_df = build_hypothetical_portfolio(
-        n_vintages, funds_per_vintage, base_year_end, commitment,
+    portfolio_df = build_sampled_portfolio_from_universe(
+        universe_df=universe_df,
+        asset_class=asset_class,
+        base_year_end=base_year_end,
+        n_vintages=n_vintages,
+        n_per_vintage=n_per_vintage,
+        commitment=commitment,
     )
     scenario_years = list(range(base_year_end - n_vintages + 1, base_year_end + 1))
 
