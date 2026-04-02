@@ -273,7 +273,19 @@ def run_simulation_constant_age_by_year(
     return_fund_level: bool = True,
     audit_simulation_number: Optional[int] = 0,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Simulate cash flows with BOY/EOY LP and manager unfunded tracking."""
+    """Simulate cash flows with BOY/EOY LP and manager unfunded tracking.
+
+    Notes for new readers
+    ---------------------
+    * We create two aggregate rows per scenario year per simulation:
+      - BOY (beginning of year): pre-flow balances and cumulative totals.
+      - EOY (end of year): post-flow balances and updated cumulative totals.
+    * Dollar and percent metrics are both stored so downstream users can
+      inspect either absolute liquidity or relative coverage.
+    * Percent denominators:
+      - BOY percentages use BOY invested NAV.
+      - EOY percentages use EOY invested NAV.
+    """
     import numpy as _np
 
     if "fund_id" not in portfolio_df.columns:
@@ -520,16 +532,19 @@ def run_simulation_constant_age_by_year(
         nav_pf[:, :n_active] = _np.maximum(nav_pf[:, :n_active], 0.0)
         nav_end = nav_pf[:, :n_active].copy()
 
+        # Roll up all underlying funds into portfolio-level annual cash flows.
         total_call = call_amounts.sum(axis=1)
         total_dist = dist_amounts.sum(axis=1)
         net_cf = total_dist - total_call
 
+        # Capture BOY balances/totals before we apply this year's flows.
         manager_unfunded_boy = manager_unfunded.copy()
         lp_unfunded_boy = lp_unfunded.copy()
         lp_reserve_boy = lp_reserve.copy()
         cum_calls_before = cum_calls_total.copy()
         cum_dists_before = cum_dists_total.copy()
 
+        # Update cumulative totals and unfunded/reserve balances for EOY.
         cum_calls_total += total_call
         cum_dists_total += total_dist
 
@@ -539,6 +554,7 @@ def run_simulation_constant_age_by_year(
         invested_nav = nav_pf[:, :n_active].sum(axis=1)
         fof_nav = invested_nav
 
+        # Convert BOY and EOY dollar balances into NAV-relative percentages.
         manager_unfunded_pct_boy = _np.where(nav_total_begin > 0, manager_unfunded_boy / nav_total_begin, 0.0)
         lp_unfunded_pct_boy = _np.where(nav_total_begin > 0, lp_unfunded_boy / nav_total_begin, 0.0)
         lp_reserve_pct_boy = _np.where(nav_total_begin > 0, lp_reserve_boy / nav_total_begin, 0.0)
@@ -546,32 +562,47 @@ def run_simulation_constant_age_by_year(
         manager_unfunded_pct = _np.where(fof_nav > 0, manager_unfunded / fof_nav, 0.0)
         lp_unfunded_pct = _np.where(fof_nav > 0, lp_unfunded / fof_nav, 0.0)
         lp_reserve_pct = _np.where(fof_nav > 0, lp_reserve / fof_nav, 0.0)
+
+        # Write one BOY row and one EOY row so reporting can show both
+        # "period points" for each scenario year.
         for sim in range(num_simulations):
             if not is_active[sim]:
                 continue
             agg_records.append({
-                "total_call": 0.0,
-                "total_distribution": 0.0,
-                "net_cashflow": 0.0,
-                "manager_unfunded_pct": float(manager_unfunded_pct_boy[sim]),
+                "scenario_year": int(year),
+                "period_point": "BOY",
+                "simulation_number": int(sim),
+                "total call": 0.0,
+                "total dist": 0.0,
+                "net cash flow": 0.0,
+                "cumulative commitment": float(running_commitment),
+                "cumulative call": float(cum_calls_before[sim]),
+                "cumulative dist": float(cum_dists_before[sim]),
                 "invested_nav": float(nav_total_begin[sim]),
-                "lp_unfunded_pct": float(lp_unfunded_pct_boy[sim]),
-                "lp_reserve_pct": float(lp_reserve_pct_boy[sim]),
-                "cumulative_commitment": running_commitment,
-                "cumulative_contributions": float(cum_calls_before[sim]),
-                "cumulative_distributions_total": float(cum_dists_before[sim]),
+                "manager unfunded $": float(manager_unfunded_boy[sim]),
+                "LP unfunded $": float(lp_unfunded_boy[sim]),
+                "LP reserve $": float(lp_reserve_boy[sim]),
+                "manager unfunded %": float(manager_unfunded_pct_boy[sim]),
+                "LP unfunded %": float(lp_unfunded_pct_boy[sim]),
+                "LP reserve %": float(lp_reserve_pct_boy[sim]),
             })
             agg_records.append({
-                "total_call": float(total_call[sim]),
-                "total_distribution": float(total_dist[sim]),
-                "net_cashflow": float(net_cf[sim]),
-                "manager_unfunded_pct": float(manager_unfunded_pct[sim]),
+                "scenario_year": int(year),
+                "period_point": "EOY",
+                "simulation_number": int(sim),
+                "total call": float(total_call[sim]),
+                "total dist": float(total_dist[sim]),
+                "net cash flow": float(net_cf[sim]),
+                "cumulative commitment": float(running_commitment),
+                "cumulative call": float(cum_calls_total[sim]),
+                "cumulative dist": float(cum_dists_total[sim]),
                 "invested_nav": float(invested_nav[sim]),
-                "lp_unfunded_pct": float(lp_unfunded_pct[sim]),
-                "lp_reserve_pct": float(lp_reserve_pct[sim]),
-                "cumulative_commitment": running_commitment,
-                "cumulative_contributions": float(cum_calls_total[sim]),
-                "cumulative_distributions_total": float(cum_dists_total[sim]),
+                "manager unfunded $": float(manager_unfunded[sim]),
+                "LP unfunded $": float(lp_unfunded[sim]),
+                "LP reserve $": float(lp_reserve[sim]),
+                "manager unfunded %": float(manager_unfunded_pct[sim]),
+                "LP unfunded %": float(lp_unfunded_pct[sim]),
+                "LP reserve %": float(lp_reserve_pct[sim]),
             })
 
         if return_fund_level:
@@ -629,6 +660,27 @@ def run_simulation_constant_age_by_year(
 
     fund_df = pd.concat(fund_level_records, ignore_index=True) if return_fund_level and fund_level_records else pd.DataFrame()
     agg_df = pd.DataFrame(agg_records)
+    # Enforce a stable, analyst-friendly output layout.
+    aggregate_output_cols = [
+        "scenario_year",
+        "period_point",
+        "simulation_number",
+        "total call",
+        "total dist",
+        "net cash flow",
+        "cumulative commitment",
+        "cumulative call",
+        "cumulative dist",
+        "invested_nav",
+        "manager unfunded $",
+        "LP unfunded $",
+        "LP reserve $",
+        "manager unfunded %",
+        "LP unfunded %",
+        "LP reserve %",
+    ]
+    if not agg_df.empty:
+        agg_df = agg_df[aggregate_output_cols]
     audit_df = pd.DataFrame(audit_records)
     return fund_df, agg_df, audit_df
 
@@ -721,6 +773,9 @@ def load_universe(filepath: str, encoding: Optional[str] = None) -> pd.DataFrame
 
 def main():
     # ---- Configuration ----
+    # These are the only knobs most users should need to touch.
+    # Keep this section explicit so newcomers can quickly understand
+    # what drives scenario construction and output destinations.
     universe_path = r"C:\Box\MZhang\Ad Hoc\2026 simulation\PF structure\Preqin_Cashflow_export.csv"
     asset_class = "Venture Capital"
     n_vintages = 20
@@ -734,9 +789,13 @@ def main():
     audit_simulation_number = 0
 
     # ---- Load data ----
+    # Universe = historical transaction-level dataset used to derive
+    # call/distribution/NAV behavior patterns by year and age.
     universe_df = load_universe(universe_path)
 
     # ---- Build portfolio ----
+    # We build a synthetic portfolio by sampling real funds by vintage.
+    # This gives us a realistic starting portfolio to project forward.
     portfolio_df = build_sampled_portfolio_from_universe(
         universe_df=universe_df,
         asset_class=asset_class,
@@ -750,6 +809,8 @@ def main():
     scenario_years = list(range(start_year, end_year + 1))
 
     # ---- Run simulation ----
+    # Generate year-specific behavior patterns, then simulate forward
+    # across scenario years with BOY/EOY aggregate snapshots.
     patterns_by_year = compute_pattern_dict_by_year(universe_df, asset_class)
     if not patterns_by_year:
         raise RuntimeError(f"No year-specific patterns for {asset_class!r}")
@@ -764,6 +825,10 @@ def main():
     )
 
     # ---- Save results ----
+    # Three outputs:
+    # 1) fund-level annual details
+    # 2) aggregate BOY/EOY portfolio metrics (requested report table)
+    # 3) optional single-simulation audit trail
     import os
     def _save_csv(df, fpath):
         os.makedirs(os.path.dirname(fpath), exist_ok=True)
@@ -778,11 +843,12 @@ def main():
         print(f"\nAudit file saved to: {Path(audit_file).resolve()}")
 
     # ---- Summary ----
+    # Quick console sanity check using the aggregate table.
     summary_cols = [
-        "total_call", "total_distribution", "net_cashflow", "invested_nav",
-        "manager_unfunded_pct", "lp_unfunded_pct", "lp_reserve_pct",
-        "cumulative_commitment", "cumulative_contributions",
-        "cumulative_distributions_total",
+        "total call", "total dist", "net cash flow", "invested_nav",
+        "manager unfunded $", "LP unfunded $", "LP reserve $",
+        "manager unfunded %", "LP unfunded %", "LP reserve %",
+        "cumulative commitment", "cumulative call", "cumulative dist",
     ]
     summary = agg_df[summary_cols].mean()
     print("\nAverage metrics:")
