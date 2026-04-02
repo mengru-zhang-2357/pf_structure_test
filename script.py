@@ -162,13 +162,11 @@ def _compute_nav_growth_by_fund_age(
         return numerator / denom
 
     nav_fa["nav_growth_pct"] = nav_fa.apply(_g, axis=1)
-    #nav_fa["nav_growth_pct"] = nav_fa.apply(_g, axis=1).clip(clip_lo, clip_hi)
     nav_fa["dist_nav_pct"] = np.where(
         nav_fa["nav_begin"] > 0,
         nav_fa["period_dists"] / nav_fa["nav_begin"],
         0.0,
     )
-    #nav_fa["dist_nav_pct"] = nav_fa["dist_nav_pct"].clip(0.0, dist_nav_clip_hi)
 
     return nav_fa[
         [
@@ -783,8 +781,8 @@ def main():
     start_year = 2006
     end_year = 2025
     commitment = 1.0
-    target_commit_pct = 0.125
-    simulations = 1
+    target_commit_pct = 0.13
+    simulations = 100
     output_path = r"C:\Box\MZhang\Ad Hoc\2026 simulation\PF structure"
     audit_simulation_number = 0
 
@@ -838,9 +836,6 @@ def main():
     if not audit_df.empty:
         audit_file = os.path.join(output_path, f"{asset_class}_sim_audit_path_sim_{audit_simulation_number}.csv")
         _save_csv(audit_df, audit_file)
-        print(f"\nAudit path for simulation {audit_simulation_number}:")
-        print(audit_df.to_string(index=False))
-        print(f"\nAudit file saved to: {Path(audit_file).resolve()}")
 
     # ---- Summary ----
     # Quick console sanity check using the aggregate table.
