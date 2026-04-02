@@ -24,6 +24,7 @@ Key features
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Optional, Iterable
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -303,7 +304,8 @@ def run_simulation_constant_age_by_year(
     num_simulations: int = 500,
     return_fund_level: bool = False,
     min_bucket_size: int = MIN_BUCKET_SIZE,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    audit_simulation_number: Optional[int] = 0,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Simulate cash flows with recallable distribution mechanics.
 
     **Initialisation (burn-in):**
@@ -379,6 +381,7 @@ def run_simulation_constant_age_by_year(
 
     fund_level_records: List[pd.DataFrame] = []
     agg_records: List[Dict[str, object]] = []
+    audit_records: List[Dict[str, object]] = []
 
     # ---- Initialise simulation state (pre-allocated for max size) ----
     cum_calls_pf = _np.zeros((num_simulations, n_max), dtype=float)
@@ -478,6 +481,7 @@ def run_simulation_constant_age_by_year(
             + call_amounts - dist_amounts
         )
         nav_pf[:, :n_active] = _np.maximum(nav_pf[:, :n_active], 0.0)
+        nav_end = nav_pf[:, :n_active].copy()
 
         # ---- Aggregate cash flows ----
         total_call = call_amounts.sum(axis=1)
@@ -561,9 +565,24 @@ def run_simulation_constant_age_by_year(
                 "nav_growth_pct": navg_mat.reshape(nr),
                 "call_amount": call_amounts.reshape(nr),
                 "dist_amount": dist_amounts.reshape(nr),
-                "underlying_nav": nav_pf[:, :n_active].reshape(nr),
+                "underlying_nav_begin": nav_begin.reshape(nr),
+                "underlying_nav_end": nav_end.reshape(nr),
             })
             fund_level_records.append(fl_df)
+
+        if audit_simulation_number is not None and 0 <= audit_simulation_number < num_simulations:
+            sim_idx = int(audit_simulation_number)
+            audit_year_df = pd.DataFrame({
+                "scenario_year": year,
+                "simulation_number": sim_idx,
+                "fund_name": fund_names_list[:n_active],
+                "fund_age": ages,
+                "call_amount": call_amounts[sim_idx, :],
+                "distribution_amount": dist_amounts[sim_idx, :],
+                "nav_begin": nav_begin[sim_idx, :],
+                "nav_end": nav_end[sim_idx, :],
+            })
+            audit_records.extend(audit_year_df.to_dict("records"))
 
         print(f"simulation year {year} completed (active funds: {n_active})")
 
@@ -573,7 +592,8 @@ def run_simulation_constant_age_by_year(
         else pd.DataFrame()
     )
     agg_df = pd.DataFrame(agg_records)
-    return fund_df, agg_df
+    audit_df = pd.DataFrame(audit_records)
+    return fund_df, agg_df, audit_df
 
 def run_simulation(
     portfolio_df: pd.DataFrame,
@@ -827,22 +847,7 @@ def random_choice(options: List[Tuple[float, float, float]]) -> Tuple[float, flo
 def load_universe(filepath: str, encoding: Optional[str] = None) -> pd.DataFrame:
     """Load the universe transaction data with robust encoding handling."""
     if filepath.endswith(('.xlsx', '.xls')):
-        import io, builtins
-        try:
-            with builtins.open(filepath, 'rb') as _f:
-                return pd.read_excel(io.BytesIO(_f.read()))
-        except (PermissionError, OSError):
-            import requests as _req
-            _token = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().get()
-            _host = spark.conf.get('spark.databricks.workspaceUrl')
-            _resp = _req.get(
-                f'https://{_host}/api/2.0/workspace/export',
-                headers={'Authorization': f'Bearer {_token}'},
-                params={'path': filepath, 'format': 'AUTO', 'direct_download': 'true'},
-            )
-            _resp.raise_for_status()
-            print(f'Loaded via REST API ({len(_resp.content)} bytes)')
-            return pd.read_excel(io.BytesIO(_resp.content))
+        return pd.read_excel(filepath)
     if encoding is not None:
         return pd.read_csv(filepath, low_memory=False, encoding=encoding)
     encodings = ['utf-8', 'ISO-8859-1', 'latin-1', 'cp1252']
@@ -864,14 +869,15 @@ def load_universe(filepath: str, encoding: Optional[str] = None) -> pd.DataFrame
 
 def main():
     # ---- Configuration ----
-    universe_path = 'C:\Box\MZhang\Ad Hoc\2026 Cash Flow Stress\Preqin_Cashflow_export-18_Feb_264addba06-22fa-4476-a2d5-ea8269cca01d.xlsx'
+    universe_path = r"./data/Preqin_Cashflow_export.xlsx"
     asset_class = "Venture Capital"
     n_vintages = 20
     funds_per_vintage = 10
     base_year_end = 2025
     commitment = 1.0
     simulations = 5000
-    output_path = 'C:\Box\MZhang\Ad Hoc\2026 simulation'
+    output_path = r"./output"
+    audit_simulation_number = 0
 
     # ---- Load data ----
     universe_df = load_universe(universe_path)
@@ -890,7 +896,7 @@ def main():
         pattern_dict_fallback = compute_pattern_dict(universe_df, asset_class)
         if not patterns_by_year:
             raise RuntimeError(f"No year-specific patterns for {asset_class!r}")
-        fund_df, agg_df = run_simulation_constant_age_by_year(
+        fund_df, agg_df, audit_df = run_simulation_constant_age_by_year(
             portfolio_df=portfolio_df,
             patterns_by_year=patterns_by_year,
             pattern_dict_fallback=pattern_dict_fallback,
@@ -898,6 +904,7 @@ def main():
             base_year_end=base_year_end,
             num_simulations=simulations,
             return_fund_level=False,
+            audit_simulation_number=audit_simulation_number,
         )
     else:
         pattern_dict = compute_pattern_dict(universe_df, asset_class)
@@ -910,27 +917,21 @@ def main():
             num_simulations=simulations,
             return_fund_level=False,
         )
+        audit_df = pd.DataFrame()
 
     # ---- Save results ----
-    import os, io as _io, base64 as _b64, requests as _req2
+    import os
     def _save_csv(df, fpath):
-        try:
-            df.to_csv(fpath, index=False)
-        except (PermissionError, OSError):
-            _tok = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().get()
-            _h = spark.conf.get("spark.databricks.workspaceUrl")
-            buf = df.to_csv(index=False)
-            _ws = fpath.replace("/Workspace", "", 1) if fpath.startswith("/Workspace") else fpath
-            _c = _b64.b64encode(buf.encode('utf-8')).decode('utf-8')
-            _r = _req2.post(
-                f"https://{_h}/api/2.0/workspace/import",
-                headers={"Authorization": f"Bearer {_tok}"},
-                json={"path": _ws, "format": "RAW", "content": _c, "overwrite": True},
-            )
-            _r.raise_for_status()
-            print(f"Saved via REST API: {fpath}")
+        os.makedirs(os.path.dirname(fpath), exist_ok=True)
+        df.to_csv(fpath, index=False)
     _save_csv(fund_df, os.path.join(output_path, f"{asset_class}_sim_fund_level_table.csv"))
     _save_csv(agg_df, os.path.join(output_path, f"{asset_class}_sim_aggregate_table.csv"))
+    if not audit_df.empty:
+        audit_file = os.path.join(output_path, f"{asset_class}_sim_audit_path_sim_{audit_simulation_number}.csv")
+        _save_csv(audit_df, audit_file)
+        print(f"\nAudit path for simulation {audit_simulation_number}:")
+        print(audit_df.to_string(index=False))
+        print(f"\nAudit file saved to: {Path(audit_file).resolve()}")
 
     # ---- Summary ----
     summary_cols = [
