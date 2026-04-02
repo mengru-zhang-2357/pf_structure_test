@@ -6,15 +6,15 @@ vehicle using historical Preqin transaction data.
 
 Key features
 ------------
-* Two-layer model: underlying fund NAVs projected to current age via
-  median Preqin patterns, then tracked forward.
+* Two-layer model: existing funds initialized from historical
+  fund-level states at current age, then tracked forward.
 * **Recallable distributions**: excess cash (dists > calls) is paid to
   the LP as a recallable distribution.  Shortfalls (calls > dists) are
   funded first by recalling previously distributed cash, then by
   drawing on the LP reserve.
 * FoF NAV = invested NAV only (no cash held in the fund).
 * LP purchase price = projected portfolio NAV; reserve = purchase price.
-* **Dynamic aging**: all funds age dynamically.  Burn-in funds start
+* **Dynamic aging**: all funds age dynamically.  Existing funds start
   at their projected age and advance each year; new fund slots start
   at age 1.  Each simulation year, 10 new fund slots are created to
   deploy the annual commitment.  Calls are capped at each fund's
@@ -330,64 +330,119 @@ def compute_pattern_dict_by_year(
 
 
 # ---------------------------------------------------------------------------
-# Initial NAV projection (burn-in)
+# Initial fund-state sampling (fund-level, age-specific)
 # ---------------------------------------------------------------------------
 
-def compute_initial_fund_navs(
-    pattern_dict: Dict[int, List[PatternLike]],
+def build_initial_state_pool_by_age(
+    universe_df: pd.DataFrame,
+    asset_class: str,
+) -> Dict[int, List[Tuple[float, float]]]:
+    """Build age buckets of historical fund states for initialization.
+
+    Returns ``state_pool_by_age[age]`` -> list of tuples:
+    ``(nav_begin_multiple, cumulative_called_pct)`` where
+    * ``nav_begin_multiple`` = NAV-at-beginning-of-age / total_called
+    * ``cumulative_called_pct`` = cumulative called before that age / total_called
+    """
+    df = universe_df.copy()
+    df["asset_class_mapped"] = df["ASSET CLASS"].apply(map_universe_asset_class)
+    df = df[df["asset_class_mapped"] == asset_class].copy()
+    if df.empty:
+        return {}
+
+    df["transaction_year"] = pd.to_datetime(df["TRANSACTION DATE"], errors="coerce").dt.year
+    df["vintage_year"] = pd.to_numeric(df["VINTAGE / INCEPTION YEAR"], errors="coerce")
+    df["fund_age"] = df["transaction_year"] - df["vintage_year"] + 1
+    df = df[(df["fund_age"].notna()) & (df["fund_age"] > 0)].copy()
+
+    df["call_amount"] = np.where(
+        df["TRANSACTION TYPE"].str.lower().str.contains("capital call", na=False),
+        df["TRANSACTION AMOUNT"].abs(),
+        0.0,
+    )
+
+    total_called = df.groupby("FUND ID")["call_amount"].sum().rename("total_called")
+
+    vals = df[df["TRANSACTION TYPE"] == "Value"].copy()
+    vals["TRANSACTION DATE"] = pd.to_datetime(vals["TRANSACTION DATE"], errors="coerce")
+    nav_fa = (
+        vals.sort_values("TRANSACTION DATE")
+        .groupby(["FUND ID", "fund_age"])
+        .agg(nav_end=("TRANSACTION AMOUNT", "last"))
+        .reset_index()
+        .sort_values(["FUND ID", "fund_age"])
+    )
+    nav_fa["nav_begin"] = nav_fa.groupby("FUND ID")["nav_end"].shift(1).fillna(0.0)
+
+    calls_fa = (
+        df.groupby(["FUND ID", "fund_age"])["call_amount"]
+        .sum()
+        .reset_index(name="period_calls")
+        .sort_values(["FUND ID", "fund_age"])
+    )
+    calls_fa["cum_calls_before_age"] = (
+        calls_fa.groupby("FUND ID")["period_calls"].cumsum() - calls_fa["period_calls"]
+    )
+
+    state_df = nav_fa.merge(
+        calls_fa[["FUND ID", "fund_age", "cum_calls_before_age"]],
+        on=["FUND ID", "fund_age"],
+        how="left",
+    )
+    state_df = state_df.merge(total_called, on="FUND ID", how="left")
+    state_df["cum_calls_before_age"] = state_df["cum_calls_before_age"].fillna(0.0)
+    state_df = state_df[state_df["total_called"] > 0].copy()
+    if state_df.empty:
+        return {}
+
+    state_df["nav_begin_multiple"] = state_df["nav_begin"] / state_df["total_called"]
+    state_df["cumulative_called_pct"] = (
+        state_df["cum_calls_before_age"] / state_df["total_called"]
+    )
+    state_df["cumulative_called_pct"] = state_df["cumulative_called_pct"].clip(0.0, 1.0)
+    state_df["nav_begin_multiple"] = state_df["nav_begin_multiple"].clip(lower=0.0)
+
+    state_pool_by_age: Dict[int, List[Tuple[float, float]]] = {}
+    for _, row in state_df.iterrows():
+        age = int(row["fund_age"])
+        state_pool_by_age.setdefault(age, []).append(
+            (float(row["nav_begin_multiple"]), float(row["cumulative_called_pct"]))
+        )
+    return state_pool_by_age
+
+
+def sample_initial_fund_state_matrices(
     ages: np.ndarray,
     commitments: np.ndarray,
+    state_pool_by_age: Dict[int, List[Tuple[float, float]]],
+    num_simulations: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Project each fund's expected NAV and cumulative calls at its current age.
+    """Sample initial NAV and cumulative-called state for each fund/simulation."""
+    import numpy as _np
 
-    Uses **median** patterns per age to deterministically simulate each
-    fund from age 1 through its current age.
-
-    Returns
-    -------
-    initial_navs : np.ndarray
-        Projected NAV per fund at its current age.
-    initial_cum_calls : np.ndarray
-        Projected cumulative capital called per fund through its current age.
-    """
-    max_age = max(pattern_dict.keys())
-
-    median_patterns: Dict[int, Tuple[float, float, float]] = {}
-    for age_key, plist in pattern_dict.items():
-        recs = [_coerce_pattern_record(p, age=age_key) for p in plist]
-        median_patterns[age_key] = (
-            float(np.median([p["call_pct"] for p in recs])),
-            float(np.median([p["dist_nav_pct"] for p in recs])),
-            float(np.median([p["nav_growth_pct"] for p in recs])),
-        )
+    if not state_pool_by_age:
+        raise ValueError("state_pool_by_age is empty")
+    max_age = max(state_pool_by_age.keys())
 
     n_funds = len(ages)
-    initial_navs = np.zeros(n_funds, dtype=float)
-    initial_cum_calls = np.zeros(n_funds, dtype=float)
+    initial_navs = _np.zeros((num_simulations, n_funds), dtype=float)
+    initial_cum_calls = _np.zeros((num_simulations, n_funds), dtype=float)
 
-    for i in range(n_funds):
-        fund_age = int(ages[i])
-        nav = 0.0
-        cum_calls = 0.0
-        commitment = float(commitments[i])
-
-        for a in range(1, fund_age + 1):
-            a_key = min(a, max_age)
-            call_pct, dist_nav_pct, growth = median_patterns.get(a_key, (0.0, 0.0, 0.0))
-
-            call_amt = call_pct * commitment
-            call_amt = min(call_amt, max(commitment - cum_calls, 0.0))
-            cum_calls += call_amt
-
-            nav_begin = nav
-            dist_amt = dist_nav_pct * nav_begin
-            dist_amt = min(dist_amt, max(nav_begin, 0.0))
-
-            nav = nav * (1.0 + growth) + call_amt - dist_amt
-            nav = max(nav, 0.0)
-
-        initial_navs[i] = nav
-        initial_cum_calls[i] = cum_calls
+    trunc_ages = _np.clip(ages.astype(int), 1, max_age)
+    for age_key in set(trunc_ages.tolist()):
+        idx = _np.where(trunc_ages == age_key)[0]
+        if idx.size == 0:
+            continue
+        pool = state_pool_by_age.get(age_key)
+        if not pool:
+            continue
+        nav_mult = _np.array([p[0] for p in pool], dtype=float)
+        cum_call_pct = _np.array([p[1] for p in pool], dtype=float)
+        L = len(pool)
+        ri = _np.random.randint(0, L, size=(num_simulations, idx.size))
+        comm = commitments[idx][None, :]
+        initial_navs[:, idx] = nav_mult[ri] * comm
+        initial_cum_calls[:, idx] = _np.minimum(cum_call_pct[ri] * comm, comm)
 
     return initial_navs, initial_cum_calls
 
@@ -409,10 +464,11 @@ def run_simulation_constant_age_by_year(
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Simulate cash flows with recallable distribution mechanics.
 
-    **Initialisation (burn-in):**
-    Each fund's underlying NAV is projected to its current age using
-    median Preqin patterns.  LP purchases the portfolio at NAV and
-    commits an equal amount as reserve (50% buffer).
+    **Initialisation (existing funds):**
+    Each existing fund is initialized directly from sampled historical
+    fund-level states at the same age (NAV-at-beginning-of-age and
+    cumulative called). LP purchases the portfolio at NAV and commits
+    an equal amount as reserve.
 
     **Dynamic aging:**
     All funds age dynamically.  Burn-in funds start at their projected
@@ -458,12 +514,12 @@ def run_simulation_constant_age_by_year(
     creation_years = _np.zeros(n_max, dtype=int)
     creation_years[:n_initial] = -1  # sentinel: burn-in fund
 
-    # ---- Burn-in ----
-    initial_navs, initial_cum_calls = compute_initial_fund_navs(
-        pattern_dict_fallback, burnin_ages, commitments_initial,
+    # ---- Existing-fund initialization from sampled historical states ----
+    initial_navs, initial_cum_calls = sample_initial_fund_state_matrices(
+        burnin_ages, commitments_initial, initial_state_pool_by_age, num_simulations,
     )
-    lp_nav_purchase = float(initial_navs.sum())
-    print(f"Projected portfolio NAV (burn-in): ${lp_nav_purchase:.2f}")
+    lp_nav_purchase = float(initial_navs.sum(axis=1).mean())
+    print(f"Projected portfolio NAV (initial state): ${lp_nav_purchase:.2f}")
     print(f"  LP purchase price = ${lp_nav_purchase:.2f}")
     print(f"  LP reserve (50%) = ${lp_nav_purchase:.2f}")
     print(f"  LP total commitment = ${2 * lp_nav_purchase:.2f}")
@@ -476,10 +532,10 @@ def run_simulation_constant_age_by_year(
 
     # ---- Initialise simulation state (pre-allocated for max size) ----
     cum_calls_pf = _np.zeros((num_simulations, n_max), dtype=float)
-    cum_calls_pf[:, :n_initial] = initial_cum_calls[None, :]
+    cum_calls_pf[:, :n_initial] = initial_cum_calls
 
     nav_pf = _np.zeros((num_simulations, n_max), dtype=float)
-    nav_pf[:, :n_initial] = initial_navs[None, :]
+    nav_pf[:, :n_initial] = initial_navs
 
     cum_calls_total = cum_calls_pf[:, :n_initial].sum(axis=1).copy()
     cum_dists_total = _np.zeros(num_simulations, dtype=float)
@@ -729,28 +785,24 @@ def run_simulation(
     first_year = scenario_years_list[0]
     initial_ages = np.maximum(first_year - vintage_years + 1, 1)
 
-    initial_navs, initial_cum_calls = compute_initial_fund_navs(
-        pattern_dict, initial_ages, commitments,
+    initial_navs, initial_cum_calls = sample_initial_fund_state_matrices(
+        initial_ages, commitments, initial_state_pool_by_age, num_simulations,
     )
-    lp_nav_purchase = float(initial_navs.sum())
-    print(f"Projected portfolio NAV (burn-in): ${lp_nav_purchase:.2f}")
+    lp_nav_purchase = float(initial_navs.sum(axis=1).mean())
+    print(f"Projected portfolio NAV (initial state): ${lp_nav_purchase:.2f}")
     print(f"  LP purchase = ${lp_nav_purchase:.2f}, reserve = ${lp_nav_purchase:.2f}")
 
     fund_level_records: List[pd.DataFrame] = []
     agg_records: List[Dict[str, object]] = []
 
     total_commitment = float(commitments.sum())
-    cumulative_calls_per_fund = _np.broadcast_to(
-        initial_cum_calls, (num_simulations, n_funds),
-    ).copy()
+    cumulative_calls_per_fund = initial_cum_calls.copy()
     cumulative_calls = cumulative_calls_per_fund.sum(axis=1).copy()
     cumulative_distributions = _np.zeros(num_simulations, dtype=float)
 
     lp_reserve = _np.full(num_simulations, lp_nav_purchase, dtype=float)
     recallable_balance = _np.zeros(num_simulations, dtype=float)
-    underlying_nav = _np.broadcast_to(
-        initial_navs, (num_simulations, n_funds),
-    ).copy()
+    underlying_nav = initial_navs.copy()
 
     annual_new_commitment = float(
         portfolio_df.groupby("vintage_year")["commitment"].sum().mean()
@@ -977,7 +1029,7 @@ def main():
     universe_path = r"./data/Preqin_Cashflow_export.xlsx"
     asset_class = "Venture Capital"
     n_vintages = 20
-    funds_per_vintage = 10
+    n_per_vintage = 10
     base_year_end = 2025
     commitment = 1.0
     simulations = 5000
@@ -990,8 +1042,13 @@ def main():
     use_year_specific = True
 
     # ---- Build portfolio ----
-    portfolio_df = build_hypothetical_portfolio(
-        n_vintages, funds_per_vintage, base_year_end, commitment,
+    portfolio_df = build_sampled_portfolio_from_universe(
+        universe_df=universe_df,
+        asset_class=asset_class,
+        base_year_end=base_year_end,
+        n_vintages=n_vintages,
+        n_per_vintage=n_per_vintage,
+        commitment=commitment,
     )
     scenario_years = list(range(base_year_end - n_vintages + 1, base_year_end + 1))
 
@@ -999,12 +1056,14 @@ def main():
     if use_year_specific:
         patterns_by_year = compute_pattern_dict_by_year(universe_df, asset_class)
         pattern_dict_fallback = compute_pattern_dict(universe_df, asset_class)
+        initial_state_pool_by_age = build_initial_state_pool_by_age(universe_df, asset_class)
         if not patterns_by_year:
             raise RuntimeError(f"No year-specific patterns for {asset_class!r}")
         fund_df, agg_df, audit_df = run_simulation_constant_age_by_year(
             portfolio_df=portfolio_df,
             patterns_by_year=patterns_by_year,
             pattern_dict_fallback=pattern_dict_fallback,
+            initial_state_pool_by_age=initial_state_pool_by_age,
             scenario_years=scenario_years,
             base_year_end=base_year_end,
             num_simulations=simulations,
@@ -1013,11 +1072,13 @@ def main():
         )
     else:
         pattern_dict = compute_pattern_dict(universe_df, asset_class)
+        initial_state_pool_by_age = build_initial_state_pool_by_age(universe_df, asset_class)
         if not pattern_dict:
             raise RuntimeError(f"No cash-flow patterns for {asset_class!r}")
         fund_df, agg_df = run_simulation(
             portfolio_df=portfolio_df,
             pattern_dict=pattern_dict,
+            initial_state_pool_by_age=initial_state_pool_by_age,
             scenario_years=scenario_years,
             num_simulations=simulations,
             return_fund_level=False,
