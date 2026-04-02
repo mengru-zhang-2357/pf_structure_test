@@ -23,6 +23,7 @@ Key features
 
 import pandas as pd
 import numpy as np
+from bisect import bisect_right
 from typing import Any, Dict, List, Tuple, Optional, Iterable
 from pathlib import Path
 
@@ -56,6 +57,36 @@ def _coerce_pattern_record(
     rec.setdefault("period_calls", 0.0)
     rec.setdefault("period_dists", 0.0)
     return rec
+
+
+def stale_mark_runoff_params(staleness_years: int) -> Tuple[float, float, float]:
+    """Return (keep_pct, dist_share, write_down_share) for stale marks."""
+    if staleness_years <= 0:
+        return 1.0, 0.0, 0.0
+    if staleness_years == 1:
+        return 0.90, 0.75, 0.25
+    if staleness_years == 2:
+        return 0.75, 0.50, 0.50
+    if 3 <= staleness_years <= 4:
+        return 0.50, 0.25, 0.75
+    if 5 <= staleness_years <= 6:
+        return 0.25, 0.10, 0.90
+    return 0.0, 0.0, 1.0
+
+
+def get_last_observed_year_at_or_before(
+    observed_years_by_fund: Dict[object, List[int]],
+    fund_id: object,
+    scenario_year: int,
+) -> Optional[int]:
+    """Find most recent observed valuation year <= scenario year."""
+    years = observed_years_by_fund.get(fund_id, [])
+    if not years:
+        return None
+    idx = bisect_right(years, int(scenario_year)) - 1
+    if idx < 0:
+        return None
+    return int(years[idx])
 
 # ---------------------------------------------------------------------------
 # Asset class mapping
@@ -282,6 +313,7 @@ def run_simulation_constant_age_by_year(
     fund_meta: Dict[object, Dict[str, object]] = {}
     fund_ids_by_vintage: Dict[int, List[object]] = {}
     fund_call_curve: Dict[object, Dict[int, float]] = {}
+    observed_years_by_fund: Dict[object, List[int]] = {}
     for year, ages_map in patterns_by_year.items():
         for _, records in ages_map.items():
             for raw in records:
@@ -291,6 +323,7 @@ def run_simulation_constant_age_by_year(
                     continue
                 yk = int(year)
                 fund_year_record[(fund_id, yk)] = rec
+                observed_years_by_fund.setdefault(fund_id, []).append(yk)
                 fund_call_curve.setdefault(fund_id, {})[yk] = float(rec.get("call_pct", 0.0))
                 meta = fund_meta.setdefault(fund_id, {})
                 if meta.get("fund_name") is None and rec.get("fund_name") is not None:
@@ -302,6 +335,9 @@ def run_simulation_constant_age_by_year(
                     fund_ids_by_vintage.setdefault(int(vy), []).append(fund_id)
 
     fund_ids_by_vintage = {vy: list(dict.fromkeys(ids)) for vy, ids in fund_ids_by_vintage.items()}
+    observed_years_by_fund = {
+        fid: sorted(set(years)) for fid, years in observed_years_by_fund.items()
+    }
     if not fund_ids_by_vintage:
         raise ValueError("patterns_by_year has no fund_id/vintage_year information")
 
@@ -381,24 +417,56 @@ def run_simulation_constant_age_by_year(
         sampled_fund_name = _np.full((num_simulations, n_active), None, dtype=object)
         sampled_vintage_year = _np.full((num_simulations, n_active), None, dtype=object)
         sampled_txn_year = _np.full((num_simulations, n_active), None, dtype=object)
+        sampled_last_mark_year = _np.full((num_simulations, n_active), None, dtype=object)
+        staleness_mat = _np.full((num_simulations, n_active), -1, dtype=int)
+        stale_keep_pct_mat = _np.ones((num_simulations, n_active), dtype=float)
+        stale_dist_share_mat = _np.zeros((num_simulations, n_active), dtype=float)
+        stale_writedown_share_mat = _np.zeros((num_simulations, n_active), dtype=float)
+        stale_runoff_mask = _np.zeros((num_simulations, n_active), dtype=bool)
 
         for fund_idx in range(n_active):
             fund_ids_col = slot_fund_ids[:, fund_idx]
             unique_ids = [fid for fid in dict.fromkeys(fund_ids_col.tolist()) if fid is not None]
             for fid in unique_ids:
                 rec = fund_year_record.get((fid, int(year)))
-                if rec is None:
-                    continue
-                rec = _coerce_pattern_record(rec, age=int(ages[fund_idx]), transaction_year=int(year))
                 mask = fund_ids_col == fid
-                call_mat[mask, fund_idx] = float(rec["call_pct"])
-                dnav_mat[mask, fund_idx] = float(rec["dist_nav_pct"])
-                navg_mat[mask, fund_idx] = float(rec["nav_growth_pct"])
-                sampled_nav_begin_mat[mask, fund_idx] = float(rec.get("nav_begin", 0.0))
-                sampled_fund_id[mask, fund_idx] = rec.get("fund_id")
-                sampled_fund_name[mask, fund_idx] = rec.get("fund_name")
-                sampled_vintage_year[mask, fund_idx] = rec.get("vintage_year")
-                sampled_txn_year[mask, fund_idx] = rec.get("transaction_year")
+                if rec is not None:
+                    rec = _coerce_pattern_record(rec, age=int(ages[fund_idx]), transaction_year=int(year))
+                    call_mat[mask, fund_idx] = float(rec["call_pct"])
+                    dnav_mat[mask, fund_idx] = float(rec["dist_nav_pct"])
+                    navg_mat[mask, fund_idx] = float(rec["nav_growth_pct"])
+                    sampled_nav_begin_mat[mask, fund_idx] = float(rec.get("nav_begin", 0.0))
+                    sampled_fund_id[mask, fund_idx] = rec.get("fund_id")
+                    sampled_fund_name[mask, fund_idx] = rec.get("fund_name")
+                    sampled_vintage_year[mask, fund_idx] = rec.get("vintage_year")
+                    sampled_txn_year[mask, fund_idx] = rec.get("transaction_year")
+                    sampled_last_mark_year[mask, fund_idx] = int(year)
+                    staleness_mat[mask, fund_idx] = 0
+                    continue
+
+                last_mark_year = get_last_observed_year_at_or_before(
+                    observed_years_by_fund=observed_years_by_fund,
+                    fund_id=fid,
+                    scenario_year=int(year),
+                )
+                if last_mark_year is None:
+                    continue
+                staleness = int(year) - int(last_mark_year)
+                keep_pct, dist_share, write_down_share = stale_mark_runoff_params(staleness)
+                rec_last = fund_year_record.get((fid, int(last_mark_year)))
+                if rec_last is not None:
+                    rec_last = _coerce_pattern_record(rec_last, age=int(ages[fund_idx]), transaction_year=int(last_mark_year))
+                    sampled_nav_begin_mat[mask, fund_idx] = float(rec_last.get("nav_begin", 0.0))
+                    sampled_fund_id[mask, fund_idx] = rec_last.get("fund_id")
+                    sampled_fund_name[mask, fund_idx] = rec_last.get("fund_name")
+                    sampled_vintage_year[mask, fund_idx] = rec_last.get("vintage_year")
+                    sampled_txn_year[mask, fund_idx] = rec_last.get("transaction_year")
+                sampled_last_mark_year[mask, fund_idx] = int(last_mark_year)
+                staleness_mat[mask, fund_idx] = staleness
+                stale_keep_pct_mat[mask, fund_idx] = keep_pct
+                stale_dist_share_mat[mask, fund_idx] = dist_share
+                stale_writedown_share_mat[mask, fund_idx] = write_down_share
+                stale_runoff_mask[mask, fund_idx] = staleness > 0
 
         c_all = commitments_all[:n_active]
         call_amounts = call_mat * c_all
@@ -417,16 +485,24 @@ def run_simulation_constant_age_by_year(
         w = _np.where(nav_total_begin[:, None] > 0, nav_begin / nav_total_begin[:, None], 1.0 / max(n_active, 1))
         avg_nav_growth = (navg_mat * w).sum(axis=1)
 
+        stale_applicable = stale_runoff_mask & _np.broadcast_to(is_active[:, None], stale_runoff_mask.shape)
         dist_amounts = dnav_mat * nav_begin
-        #dist_amounts = _np.minimum(dist_amounts, _np.maximum(nav_begin, 0.0))
+        stale_nav_end = nav_begin * stale_keep_pct_mat
+        stale_haircut_amt = _np.maximum(nav_begin - stale_nav_end, 0.0)
+        stale_dist_amounts = stale_haircut_amt * stale_dist_share_mat
+        write_down_amounts = stale_haircut_amt * stale_writedown_share_mat
+        dist_amounts = _np.where(stale_applicable, stale_dist_amounts, dist_amounts)
         dist_amounts = _np.where(is_active[:, None], dist_amounts, 0.0)
+        write_down_amounts = _np.where(is_active[:, None], write_down_amounts, 0.0)
 
         nav_pf[:, :n_active] = nav_pf[:, :n_active] * (1.0 + navg_mat) + call_amounts - dist_amounts
+        nav_pf[:, :n_active] = _np.where(stale_applicable, stale_nav_end, nav_pf[:, :n_active])
         nav_pf[:, :n_active] = _np.maximum(nav_pf[:, :n_active], 0.0)
         nav_end = nav_pf[:, :n_active].copy()
 
         total_call = call_amounts.sum(axis=1)
         total_dist = dist_amounts.sum(axis=1)
+        total_write_down = write_down_amounts.sum(axis=1)
         net_cf = total_dist - total_call
 
         manager_unfunded_boy = manager_unfunded.copy()
@@ -468,6 +544,7 @@ def run_simulation_constant_age_by_year(
                 "simulation_number": sim,
                 "total_call": 0.0,
                 "total_distribution": 0.0,
+                "total_write_down": 0.0,
                 "net_cashflow": 0.0,
                 "manager_unfunded_dollar": float(manager_unfunded_boy[sim]),
                 "manager_unfunded_pct": float(manager_unfunded_pct_boy[sim]),
@@ -495,6 +572,7 @@ def run_simulation_constant_age_by_year(
                 "simulation_number": sim,
                 "total_call": float(total_call[sim]),
                 "total_distribution": float(total_dist[sim]),
+                "total_write_down": float(total_write_down[sim]),
                 "net_cashflow": float(net_cf[sim]),
                 "manager_unfunded_dollar": float(manager_unfunded[sim]),
                 "manager_unfunded_pct": float(manager_unfunded_pct[sim]),
@@ -534,9 +612,13 @@ def run_simulation_constant_age_by_year(
                 "sampled_fund_name": sampled_fund_name.reshape(nr),
                 "sampled_vintage_year": sampled_vintage_year.reshape(nr),
                 "sampled_transaction_year": sampled_txn_year.reshape(nr),
+                "sampled_last_mark_year": sampled_last_mark_year.reshape(nr),
+                "staleness_years": staleness_mat.reshape(nr),
+                "stale_keep_pct": stale_keep_pct_mat.reshape(nr),
                 "sampled_nav_begin": sampled_nav_begin_mat.reshape(nr),
                 "call_amount": call_amounts.reshape(nr),
                 "dist_amount": dist_amounts.reshape(nr),
+                "write_down_amount": write_down_amounts.reshape(nr),
                 "underlying_nav_begin": nav_begin.reshape(nr),
                 "underlying_nav_end": nav_end.reshape(nr),
             })
@@ -553,6 +635,7 @@ def run_simulation_constant_age_by_year(
                     "fund_age": ages,
                     "call_amount": call_amounts[sim_idx, :],
                     "distribution_amount": dist_amounts[sim_idx, :],
+                    "write_down_amount": write_down_amounts[sim_idx, :],
                     "nav_begin": nav_begin[sim_idx, :],
                     "nav_end": nav_end[sim_idx, :],
                 })
