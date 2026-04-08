@@ -301,7 +301,7 @@ def run_simulation_constant_age_by_year(
     burnin_ages = _np.maximum(start_year - vintage_years_initial + 1, 1)
 
     funds_per_vintage = int(portfolio_df.groupby("vintage_year").size().mode().iloc[0])
-    initial_fund_ids = portfolio_df["fund_id"].to_numpy()
+    initial_slot_vintages = portfolio_df["vintage_year"].to_numpy(dtype=int)
 
     n_new_total = funds_per_vintage * n_scenario_years
     n_max = n_initial + n_new_total
@@ -347,14 +347,25 @@ def run_simulation_constant_age_by_year(
     if not fund_ids_by_vintage:
         raise ValueError("patterns_by_year has no fund_id/vintage_year information")
 
-    initial_navs_vec = _np.zeros(n_initial, dtype=float)
-    initial_cum_calls_vec = _np.zeros(n_initial, dtype=float)
-    for i, fid in enumerate(initial_fund_ids):
+    sampled_initial_ids = _np.full((num_simulations, n_initial), None, dtype=object)
+    for fund_idx, vintage_year in enumerate(initial_slot_vintages):
+        vintage_pool = fund_ids_by_vintage.get(int(vintage_year), [])
+        if vintage_pool:
+            sampled_initial_ids[:, fund_idx] = _np.random.choice(vintage_pool, size=num_simulations, replace=True)
+        else:
+            sampled_initial_ids[:, fund_idx] = portfolio_df.iloc[fund_idx]["fund_id"]
+
+    initial_metrics_cache: Dict[object, Tuple[float, float]] = {}
+
+    def _initial_metrics_for_fund(fid: object) -> Tuple[float, float]:
+        if fid in initial_metrics_cache:
+            return initial_metrics_cache[fid]
         last_mark_year = get_last_observed_year_at_or_before(
             observed_years_by_fund=observed_years_by_fund,
             fund_id=fid,
             scenario_year=int(start_year),
         )
+        nav_begin = 0.0
         if last_mark_year is not None:
             rec_last = fund_year_record.get((fid, int(last_mark_year)))
             if rec_last is not None:
@@ -362,31 +373,30 @@ def run_simulation_constant_age_by_year(
                 staleness = int(start_year) - int(last_mark_year)
                 keep_pct, _, _ = stale_mark_runoff_params(staleness)
                 nav_begin = nav_mark * keep_pct
-            else:
-                nav_begin = 0.0
-        else:
-            nav_begin = 0.0
-        if nav_begin > 0.0:
-            nav_begin_multiple = nav_begin / FUND_COMMITMENT
-            initial_navs_vec[i] = nav_begin_multiple * commitments_initial[i]
-
+        nav_begin_multiple = (nav_begin / FUND_COMMITMENT) if nav_begin > 0.0 else 0.0
         hist_calls = fund_call_curve.get(fid, {})
         called_pct_before_start = float(sum(v for y, v in hist_calls.items() if y < int(start_year)))
         called_pct_before_start = float(_np.clip(called_pct_before_start, 0.0, 1.0))
-        initial_cum_calls_vec[i] = commitments_initial[i] * called_pct_before_start
+        initial_metrics_cache[fid] = (nav_begin_multiple, called_pct_before_start)
+        return initial_metrics_cache[fid]
+
+    initial_navs_pf = _np.zeros((num_simulations, n_initial), dtype=float)
+    initial_cum_calls_pf = _np.zeros((num_simulations, n_initial), dtype=float)
+    for sim in range(num_simulations):
+        for fund_idx in range(n_initial):
+            fid = sampled_initial_ids[sim, fund_idx]
+            nav_multiple, called_pct_before_start = _initial_metrics_for_fund(fid)
+            initial_navs_pf[sim, fund_idx] = nav_multiple * commitments_initial[fund_idx]
+            initial_cum_calls_pf[sim, fund_idx] = commitments_initial[fund_idx] * called_pct_before_start
 
     nav_pf = _np.zeros((num_simulations, n_max), dtype=float)
-    nav_pf[:, :n_initial] = _np.broadcast_to(initial_navs_vec, (num_simulations, n_initial))
+    nav_pf[:, :n_initial] = initial_navs_pf
     cum_calls_pf = _np.zeros((num_simulations, n_max), dtype=float)
-    cum_calls_pf[:, :n_initial] = _np.broadcast_to(initial_cum_calls_vec, (num_simulations, n_initial))
+    cum_calls_pf[:, :n_initial] = initial_cum_calls_pf
 
-    lp_nav_purchase = float(initial_navs_vec.sum())
-    manager_unfunded = _np.full(
-        num_simulations,
-        _np.maximum(commitments_initial.sum() - initial_cum_calls_vec.sum(), 0.0),
-        dtype=float,
-    )
-    lp_unfunded = _np.full(num_simulations, lp_nav_purchase, dtype=float)
+    lp_nav_purchase = initial_navs_pf.sum(axis=1)
+    manager_unfunded = _np.maximum(commitments_initial.sum() - initial_cum_calls_pf.sum(axis=1), 0.0)
+    lp_unfunded = lp_nav_purchase.copy()
     lp_reserve = lp_unfunded - manager_unfunded
     is_active = _np.ones(num_simulations, dtype=bool)
 
@@ -397,7 +407,7 @@ def run_simulation_constant_age_by_year(
     running_commitment = float(commitments_initial.sum())
 
     slot_fund_ids = _np.full((num_simulations, n_max), None, dtype=object)
-    slot_fund_ids[:, :n_initial] = _np.broadcast_to(initial_fund_ids, (num_simulations, n_initial))
+    slot_fund_ids[:, :n_initial] = sampled_initial_ids
 
     fund_names_list: List[str] = list(portfolio_df["fund_name"].to_numpy())
 
